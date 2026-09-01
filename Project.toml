@@ -1,0 +1,10 @@
+[deps]
+CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+ColorSchemes = "35d6a980-a343-548e-a6ea-1d62b119f2f4"
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+KernelDensity = "5ab0869b-81aa-558d-bb23-cbf5423bbe9b"
+MultivariateStats = "6f286f6a-111f-5878-ab1e-185364afe411"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+UMAP = "c4f8c510-2410-5be4-91d7-4fbaeb39457e"
