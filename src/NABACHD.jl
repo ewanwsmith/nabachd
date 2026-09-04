@@ -47,7 +47,7 @@ export ProfileSet, nvariants, nalleles,
        load_wide, load_long, load_cd8scape, load_frequencies, frequency_vector,
        read_allele_list, subset_alleles, align_profiles,
        correlation_matrix, topk_mean, weighted_neighbourhood_r,
-       calibrate_k, find_k_star, neighbourhood_scores,
+       default_k_sequence, calibrate_k, find_k_star, neighbourhood_scores,
        fisher_z, fisher_zinv,
        Neighbourhood, analyse
 
@@ -92,6 +92,11 @@ Run the full neighbourhood analysis.
 function analyse(query::ProfileSet, reference::ProfileSet;
                  frequencies=nothing, k=:auto, fisher::Bool=true, k_seq=nothing)
     Mq, Mr = align_profiles(query, reference)
+    # warn about alleles with no binding variation across the shared variants:
+    # their correlations are undefined and will be treated as 0.
+    qbad = count(j -> std(view(Mq, :, j)) == 0, axes(Mq, 2))
+    rbad = count(j -> std(view(Mr, :, j)) == 0, axes(Mr, 2))
+    (qbad > 0 || rbad > 0) && @warn "Alleles with no binding variation across the shared variants; their correlations are treated as 0" query_degenerate = qbad reference_degenerate = rbad
     R = correlation_matrix(Mq, Mr)
 
     ks = k_seq === nothing ? default_k_sequence(size(R, 2)) : k_seq

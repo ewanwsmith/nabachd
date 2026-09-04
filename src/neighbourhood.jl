@@ -28,7 +28,14 @@ column of `Mr` (reference profiles). Returns an `n_query × n_reference` matrix.
 function correlation_matrix(Mq::AbstractMatrix, Mr::AbstractMatrix)
     size(Mq, 1) == size(Mr, 1) ||
         error("correlation_matrix: query and reference have different variant counts")
-    cor(Mq, Mr)
+    R = cor(Mq, Mr)
+    # A zero-variance (constant / never-binding on the shared variants) profile has
+    # undefined Pearson r (NaN); treat it as 0 (no linear similarity) so a single
+    # degenerate allele can't poison the whole matrix.
+    @inbounds for i in eachindex(R)
+        isfinite(R[i]) || (R[i] = 0.0)
+    end
+    return R
 end
 
 """
