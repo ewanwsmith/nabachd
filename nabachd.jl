@@ -85,6 +85,16 @@ WEIGHTS & PANELS:
 METHOD:
     --k <auto|INT>             Neighbourhood size (default auto = crossover k*).
     --no-fisher                Plain weighted mean instead of Fisher-z averaging.
+    --no-panel                 Skip the panel-level neighbourhood alignment
+                               (frequency-weighted CKA + permutation null).
+    --nperm <int>              Permutations for the alignment null (default 1000).
+    --sensitivity              Also run the zero-inflation sensitivity check:
+                               recompute the alignment on informative variants
+                               only and report the difference.
+    --mask-mode <m>            Which panel must show binding signal for a variant
+                               to be kept: either|both|query|reference (default either).
+    --mask-threshold <float>   Peak |escape| above which a variant counts as
+                               informative (default 0.0 = any non-zero).
     --seed <int>               Random seed for the UMAP embedding (default 1320,
                                matching CD8scape's default).
 
@@ -179,10 +189,35 @@ end
 kspec = getflag(argv, "--k"; default="auto")
 k = kspec == "auto" ? :auto : parse(Int, kspec)
 fisher = !hasflag(argv, "--no-fisher")
+panel = !hasflag(argv, "--no-panel")
+nperm = parse(Int, getflag(argv, "--nperm"; default="1000"))
+sensitivity = hasflag(argv, "--sensitivity")
+mask_mode = Symbol(getflag(argv, "--mask-mode"; default="either"))
+mask_threshold = parse(Float64, getflag(argv, "--mask-threshold"; default="0.0"))
 
 println("Running analysis ...")
-res = analyse(query, reference; frequencies=freqs, k=k, fisher=fisher)
+res = analyse(query, reference; frequencies=freqs, k=k, fisher=fisher,
+              panel=panel, nperm=nperm)
 println("  neighbourhood size k = ", res.k)
+if res.alignment !== nothing
+    a = res.alignment
+    println("  panel neighbourhood alignment = ", round(a.alignment, digits=4),
+            "  (z = ", round(a.z, digits=2), ", p = ", a.p,
+            a.weighted ? ", frequency-weighted)" : ", unweighted)")
+end
+
+sens = nothing
+if sensitivity
+    println("Running zero-inflation sensitivity ...")
+    sens = alignment_sensitivity(query, reference; frequencies=freqs,
+                                 threshold=mask_threshold, mode=mask_mode, nperm=nperm)
+    println("  full   alignment = ", round(sens.full.alignment, digits=4),
+            "  (", sens.n_variants_full, " variants)")
+    println("  masked alignment = ", round(sens.masked.alignment, digits=4),
+            "  (", sens.n_variants_masked, " informative, ",
+            round(100 * sens.frac_retained, digits=1), "% kept, mode=:", sens.mode, ")")
+    println("  Δ (masked − full) = ", round(sens.delta, digits=4))
+end
 
 suffix = getflag(argv, "--suffix"; default="")
 sfx = isempty(suffix) ? "" : "_" * suffix
@@ -194,6 +229,32 @@ CSV.write(scores_path, res.scores)
 CSV.write(calib_path, res.calibration)
 println("  wrote ", scores_path)
 println("  wrote ", calib_path)
+
+if res.alignment !== nothing
+    a = res.alignment
+    align_path = joinpath(outdir, "panel_alignment$sfx.csv")
+    CSV.write(align_path, DataFrame(
+        metric      = ["neighbourhood_alignment"],
+        alignment   = [a.alignment], z = [a.z], p = [a.p],
+        null_mean   = [a.null_mean], null_sd = [a.null_sd], nperm = [a.nperm],
+        weighted    = [a.weighted], n_query = [a.n_query],
+        n_reference = [a.n_reference], n_variants = [a.n_variants]))
+    println("  wrote ", align_path)
+end
+
+if sens !== nothing
+    sens_path = joinpath(outdir, "panel_alignment_sensitivity$sfx.csv")
+    CSV.write(sens_path, DataFrame(
+        variant_set    = ["all", "informative"],
+        alignment      = [sens.full.alignment, sens.masked.alignment],
+        z              = [sens.full.z, sens.masked.z],
+        p              = [sens.full.p, sens.masked.p],
+        n_variants     = [sens.n_variants_full, sens.n_variants_masked],
+        frac_retained  = [1.0, sens.frac_retained],
+        mask_mode      = [String(sens.mode), String(sens.mode)],
+        mask_threshold = [sens.threshold, sens.threshold]))
+    println("  wrote ", sens_path)
+end
 
 if !hasflag(argv, "--no-figures")
     println("Rendering figures ...")

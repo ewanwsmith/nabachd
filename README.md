@@ -10,15 +10,23 @@ quantifying the *meaningfulness* of MHC-I binding escape from one allele panel
 relative to another, from
 [CD8scape](https://doi.org/10.64898/2026.04.20.719634) output.
 
-For each allele in a **query** panel (e.g. cattle BoLA), its per-variant escape
-profile is correlated against every allele in a larger, optionally
-frequency-weighted **reference** panel (e.g. the human HLA repertoire). A
-neighbourhood size *k* is chosen automatically, and the **frequency-weighted
-top-*k* neighbourhood r** summarises how closely each query allele's escape
-landscape is mirrored by the reference. Both panels are fully configurable, so
-the method applies to any pair of panels netMHCpan / CD8scape can handle — a
-non-human panel against the human HLA repertoire, or one human panel against
-another (e.g. across populations), not only BoLA vs HLA.
+The method works at two levels. **Per allele:** for each allele in a **query**
+panel (e.g. cattle BoLA), its per-variant escape profile is correlated against
+every allele in a larger, optionally frequency-weighted **reference** panel
+(e.g. the human HLA repertoire); a neighbourhood size *k* is chosen
+automatically, and the **frequency-weighted top-*k* neighbourhood r** summarises
+how closely that query allele's escape landscape is mirrored by the reference.
+**Per panel:** a single **neighbourhood alignment** — the frequency-weighted
+centred kernel alignment (CKA) between the two panels, with a permutation null —
+scores whether the two panels organise the *variant* escape landscape the same
+way. Unlike the per-allele metric, the alignment is **symmetric**:
+`alignment(A, B) = alignment(B, A)`, so the **query** / **reference** labels
+(which do matter for the per-allele step) are irrelevant to it — neither panel
+is privileged. It is bounded in [0, 1] and comparable across panel pairs of
+different sizes. Both panels are fully configurable, so the method applies to any
+pair of panels netMHCpan / CD8scape can handle — a non-human panel against the
+human HLA repertoire, or one human panel against another (e.g. across
+populations), not only BoLA vs HLA.
 
 It reads **raw CD8scape output directly** and, in the style of CD8scape, is
 driven by a command you point at your data. You pass a list of
@@ -59,10 +67,50 @@ set of variants:
 
    evaluated across all query alleles; `k*` is the last integer at which the
    score is still peak-dominant (⌊crossover⌋). Override with `--k`.
-4. **Weighted neighbourhood r** (primary metric): for the *k* nearest reference
-   alleles, weight their correlations by reference (carrier) frequency,
-   renormalise within the neighbourhood, and average on the Fisher *z* scale
-   (back-transformed). With no frequency file the analysis is unweighted.
+4. **Weighted neighbourhood r** (primary *per-allele* metric): for the *k*
+   nearest reference alleles, weight their correlations by reference (carrier)
+   frequency, renormalise within the neighbourhood, and average on the Fisher
+   *z* scale (back-transformed). With no frequency file the analysis is
+   unweighted.
+
+5. **Neighbourhood alignment** (the *panel-level* metric): a single score
+   **between** the two panels — the query/reference roles from the per-allele
+   step do not apply here, the alignment is symmetric and treats the panels
+   interchangeably. Where `weighted_nbhd_r` asks, per allele, how well one allele
+   is mirrored, the alignment asks whether the two panels organise the *variant*
+   escape landscape the same way. It is the frequency-weighted linear **centred
+   kernel alignment (CKA)** between the two escape-profile matrices X and Y
+   (`m variants` × the alleles of each panel), each allele profile mean-centred
+   across variants:
+
+   ```
+   alignment = ‖Yᵀ X‖_F²  /  (‖Xᵀ X‖_F · ‖Yᵀ Y‖_F)
+   ```
+
+   Swapping X and Y leaves this unchanged (`‖YᵀX‖_F = ‖XᵀY‖_F`), which is why it
+   is symmetric.
+
+   Carrier frequencies weight it by scaling each allele column by √w, so common
+   alleles dominate the geometry. The alignment is in [0, 1], **symmetric**,
+   needs no allele correspondence between panels (invariant to rotation /
+   relabelling of the allele basis) and is defined for panels of different sizes
+   — so alignments for different panel pairs (BoLA↔HLA, BoLA↔SLA, HLA-pop↔HLA-pop)
+   are directly comparable. A permutation null (shuffling one panel's variant
+   rows relative to the other) gives an empirical *p* and a standardised effect
+   *z*, which de-baseline the shared zero-inflation of escape profiles and make
+   the score comparable across pairs. Skip it with `--no-panel`; set the
+   permutation count with `--nperm`.
+
+   *Zero-inflation sensitivity* (`--sensitivity`): escape profiles fill
+   non-binding / structurally-absent cells with 0, and a block of all-zero
+   (non-binding) variant rows can inflate the alignment by letting the panels
+   agree merely on *which* variants are immunologically active at all. The check
+   recomputes the alignment on the informative variants only — those with peak
+   |escape| above `--mask-threshold` in the panel(s) selected by `--mask-mode`
+   (`either`/`both`/`query`/`reference`) — and reports the difference. A small Δ
+   means the shared zeros were not driving the score. (Masking is at the variant
+   level, where the zero-fill lives; entry-level masking is undefined for a
+   global matrix metric like CKA.)
 
 ## Pipeline
 
@@ -146,8 +194,12 @@ res = analyse(query, reference;
               k = :auto)
 
 res.k               # selected neighbourhood size (27 for this panel)
-res.scores          # ranked DataFrame
+res.scores          # ranked per-allele DataFrame (weighted_nbhd_r, …)
 res.calibration     # k-sweep table
+res.alignment       # panel-level neighbourhood alignment (frequency-weighted
+                    # CKA + permutation null); `nothing` if analysed with panel=false
+res.alignment.alignment   # the CKA in [0, 1]
+res.alignment.z, res.alignment.p   # standardised effect and empirical p vs the null
 
 include("src/plots.jl")     # loads CairoMakie + UMAP
 NeighbourhoodPlots.save_all_figures(res, query, reference; outdir="figures")
@@ -158,7 +210,11 @@ NeighbourhoodPlots.save_all_figures(res, query, reference; outdir="figures")
 `load_wide` reads a wide table. Other key functions: `load_frequencies`,
 `read_allele_list`, `subset_alleles`, `analyse`, and the lower-level
 `correlation_matrix`, `find_k_star`, `neighbourhood_scores`,
-`weighted_neighbourhood_r`.
+`weighted_neighbourhood_r`. The panel-level metric is `panel_alignment` (which
+also has a matrix method) and the bare kernel-alignment kernel is `cka(Mq, Mr;
+wq, wr)`; `column_center` exposes the centring step. The zero-inflation check is
+`alignment_sensitivity` (matrix + `ProfileSet` methods), with `informative_variants`
+for the variant mask.
 
 ## Output
 
@@ -173,6 +229,16 @@ NeighbourhoodPlots.save_all_figures(res, query, reference; outdir="figures")
 | `nbhd_r` | unweighted top-*k* mean correlation |
 | `weighted_nbhd_r` | frequency-weighted, Fisher-z top-*k* mean — **primary metric** |
 | `nearest_reference` / `nearest_r` | closest single reference allele and its r |
+
+Plus `panel_alignment[_suffix].csv` — one row with the panel-level
+**neighbourhood alignment** (`alignment`) and its permutation-null significance
+(`z`, `p`, `null_mean`, `null_sd`, `nperm`), whether it was frequency-`weighted`,
+and the aligned panel dimensions (`n_query`, `n_reference`, `n_variants`). Written
+unless `--no-panel` is given.
+
+With `--sensitivity`, also `panel_alignment_sensitivity[_suffix].csv` — two rows
+(`all` vs `informative` variants) with each `alignment`, `z`, `p`, the variant
+count, `frac_retained`, and the `mask_mode` / `mask_threshold` used.
 
 Also `neighbourhood_calibration[_suffix].csv` (the k-sweep) and, in
 `neighbourhood_figures[_suffix]/`, the figure set (viridis throughout):

@@ -39,6 +39,8 @@ module NABACHD
 using CSV
 using DataFrames
 using Statistics
+using LinearAlgebra
+using Random
 
 include("io.jl")
 include("neighbourhood.jl")
@@ -49,6 +51,8 @@ export ProfileSet, nvariants, nalleles,
        correlation_matrix, topk_mean, weighted_neighbourhood_r,
        default_k_sequence, calibrate_k, find_k_star, neighbourhood_scores,
        fisher_z, fisher_zinv,
+       column_center, cka, panel_alignment, PanelAlignment,
+       informative_variants, alignment_sensitivity, AlignmentSensitivity,
        Neighbourhood, analyse
 
 """
@@ -61,6 +65,9 @@ Result of an `analyse` run:
 - `k::Int`                  — neighbourhood size used
 - `R::Matrix{Float64}`      — query × reference correlation matrix
 - `query_alleles`, `reference_alleles`, `frequencies` — the aligned inputs
+- `alignment::Union{PanelAlignment,Nothing}` — the panel-level neighbourhood
+  alignment (frequency-weighted CKA + permutation null), or `nothing` when the
+  panel metric was skipped (`panel=false`)
 """
 struct Neighbourhood
     scores::DataFrame
@@ -70,11 +77,14 @@ struct Neighbourhood
     query_alleles::Vector{String}
     reference_alleles::Vector{String}
     frequencies::Vector{Float64}
+    alignment::Union{PanelAlignment,Nothing}
 end
 
 Base.show(io::IO, n::Neighbourhood) = print(io,
     "Neighbourhood(k=$(n.k), $(length(n.query_alleles)) query × " *
-    "$(length(n.reference_alleles)) reference alleles)")
+    "$(length(n.reference_alleles)) reference alleles" *
+    (n.alignment === nothing ? "" :
+        ", alignment=$(round(n.alignment.alignment, digits=3))") * ")")
 
 """
     analyse(query::ProfileSet, reference::ProfileSet;
@@ -88,9 +98,14 @@ Run the full neighbourhood analysis.
                   to fix the neighbourhood size.
 - `fisher`      — Fisher z-average the weighted metric (default `true`).
 - `k_seq`       — optional explicit k sweep for calibration.
+- `panel`       — also compute the panel-level neighbourhood alignment
+                  (frequency-weighted CKA + permutation null); default `true`.
+- `nperm`       — permutations for the alignment null (default `1000`).
+- `rng`         — RNG for the permutation null.
 """
 function analyse(query::ProfileSet, reference::ProfileSet;
-                 frequencies=nothing, k=:auto, fisher::Bool=true, k_seq=nothing)
+                 frequencies=nothing, k=:auto, fisher::Bool=true, k_seq=nothing,
+                 panel::Bool=true, nperm::Int=1000, rng=Random.default_rng())
     Mq, Mr = align_profiles(query, reference)
     # warn about alleles with no binding variation across the shared variants:
     # their correlations are undefined and will be treated as 0.
@@ -110,8 +125,19 @@ function analyse(query::ProfileSet, reference::ProfileSet;
     freq = frequency_vector(reference, frequencies)
     scores = neighbourhood_scores(R, query.alleles, reference.alleles, freq;
                                   k=k_used, fisher=fisher)
+
+    alignment = if panel
+        wq = frequencies === nothing ? nothing : frequency_vector(query, frequencies)
+        wr = frequencies === nothing ? nothing : freq   # reference weights already computed
+        panel_alignment(Mq, Mr; wq=wq, wr=wr, nperm=nperm, rng=rng,
+                        weighted=(frequencies !== nothing),
+                        n_query=nalleles(query), n_reference=nalleles(reference))
+    else
+        nothing
+    end
+
     Neighbourhood(scores, calibration, k_used, R,
-                  copy(query.alleles), copy(reference.alleles), freq)
+                  copy(query.alleles), copy(reference.alleles), freq, alignment)
 end
 
 end # module

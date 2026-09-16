@@ -1,6 +1,7 @@
 using Test
 using DataFrames
 using Statistics
+using LinearAlgebra
 using CSV
 using Random
 
@@ -304,6 +305,127 @@ Random.seed!(1234)   # determinism for the randomised fixtures below
         @test analyse(q, r; k=1).k == 1
         nf = analyse(q, r; k=3, fisher=false)
         @test all(isfinite, nf.scores.weighted_nbhd_r)
+
+        # panel alignment attached by default, skippable, and matches cka()
+        @test res.alignment isa PanelAlignment
+        @test 0 <= res.alignment.alignment <= 1
+        @test res.alignment.alignment ≈ cka(align_profiles(q, r)...) atol = 1e-8
+        @test res.alignment.weighted == false
+        @test analyse(q, r; k=2, panel=false).alignment === nothing
+        # frequency-weighted analyse marks the alignment weighted
+        wres2 = analyse(q, r; frequencies=freqs, k=2)
+        @test wres2.alignment.weighted == true
+    end
+
+    # ─────────────────────────────────────────────────────────────────────────
+    @testset "cka (panel neighbourhood alignment)" begin
+        rng = MersenneTwister(42)
+        m, n = 400, 6
+        X = randn(rng, m, n)
+
+        # identity, isotropic scaling + shift, and allele relabelling → 1
+        @test cka(X, X) ≈ 1.0 atol = 1e-8
+        @test cka(X, 3 .* X .+ 5.0) ≈ 1.0 atol = 1e-8          # centring removes shift
+        @test cka(X, X[:, [6, 5, 4, 3, 2, 1]]) ≈ 1.0 atol = 1e-8
+
+        # rotation of the allele basis leaves CKA unchanged (no correspondence needed)
+        Q = Matrix(qr(randn(rng, n, n)).Q)
+        @test cka(X, X * Q) ≈ 1.0 atol = 1e-6
+
+        # symmetry, and different allele counts are fine
+        Y = randn(rng, m, 4)
+        @test cka(X, Y) ≈ cka(Y, X) atol = 1e-10
+        @test cka(X, Y) < 0.3                                   # unrelated panels
+
+        # breaking the variant alignment collapses similarity toward 0
+        perm = randperm(rng, m)
+        @test cka(X, X[perm, :]) < 0.2
+
+        # frequency weighting: uniform weights == unweighted; uneven weights differ
+        Yr = X * Q .+ 0.3 .* randn(rng, m, n)
+        @test cka(X, Yr; wq=ones(n), wr=ones(n)) ≈ cka(X, Yr) atol = 1e-8
+        @test cka(X, Yr; wq=[5.0, 5, 1, 1, 0.1, 0.1], wr=[5.0, 5, 1, 1, 0.1, 0.1]) != cka(X, Yr)
+
+        # degenerate (zero-variance) columns don't produce NaN
+        Xd = hcat(X, zeros(m))
+        @test cka(Xd, Xd) ≈ 1.0 atol = 1e-8
+        @test cka(zeros(m, 2), X[:, 1:2]) == 0.0                # all-degenerate → guarded 0
+
+        # dimension guard
+        @test_throws Exception cka(randn(rng, 10, 2), randn(rng, 9, 2))
+        @test_throws Exception cka(X, X; wq=ones(n + 1))        # bad weight length
+    end
+
+    # ─────────────────────────────────────────────────────────────────────────
+    @testset "panel_alignment + permutation null" begin
+        m, n = 500, 6
+        base = randn(MersenneTwister(11), m, n)
+        related = base .+ 0.2 .* randn(MersenneTwister(12), m, n)   # shares structure
+        unrelated = randn(MersenneTwister(13), m, n)                # independent
+
+        pr = panel_alignment(base, related; nperm=300, rng=MersenneTwister(1))
+        @test pr isa PanelAlignment
+        @test pr.alignment > 0.5
+        @test pr.z > 5.0 && pr.p < 0.01                         # far above the null
+        @test isfinite(pr.null_mean) && pr.null_sd > 0
+        @test pr.alignment > pr.null_mean                       # observed beats the null
+        @test pr.n_query == n && pr.n_reference == n && pr.n_variants == m
+
+        pu = panel_alignment(base, unrelated; nperm=300, rng=MersenneTwister(2))
+        @test pu.p > 0.05 && pu.z < pr.z                        # not significant
+
+        # ProfileSet convenience method aligns + weights via frequencies
+        keys = DataFrame(V=string.(1:m))
+        q = ProfileSet(keys, ["Q$i" for i in 1:n], base)
+        r = ProfileSet(keys, ["R$i" for i in 1:n], related)
+        pa = panel_alignment(q, r; nperm=200, rng=MersenneTwister(3))
+        @test pa.alignment ≈ cka(base, related) atol = 1e-8
+        @test pa.weighted == false
+        freqs = Dict("R1" => 0.5, "R2" => 0.3, "Q1" => 0.4)      # partial; others → 0
+        paw = panel_alignment(q, r; frequencies=freqs, nperm=50, rng=MersenneTwister(4))
+        @test paw.weighted == true && isfinite(paw.alignment)
+        @test occursin("PanelAlignment", sprint(show, paw))
+    end
+
+    # ─────────────────────────────────────────────────────────────────────────
+    @testset "zero-inflation sensitivity" begin
+        rng = MersenneTwister(99)
+        ninfo, nzero, n = 120, 380, 5
+        sig = randn(rng, ninfo, n)
+        Xi = sig .+ 0.2 .* randn(rng, ninfo, n)          # informative, correlated
+        Yi = sig .+ 0.5 .* randn(rng, ninfo, n)
+        Mq = vcat(Xi, zeros(nzero, n))                    # + a shared non-binding block
+        Mr = vcat(Yi, zeros(nzero, n))
+
+        mask = informative_variants(Mq, Mr)
+        @test count(mask) == ninfo                        # exactly the nonzero rows
+        @test all(mask[1:ninfo]) && !any(mask[ninfo+1:end])
+        @test count(informative_variants(Mq, Mr; mode=:both)) == ninfo
+
+        s = alignment_sensitivity(Mq, Mr; nperm=200, rng=MersenneTwister(5))
+        @test s isa AlignmentSensitivity
+        @test s.n_variants_full == ninfo + nzero
+        @test s.n_variants_masked == ninfo
+        @test s.frac_retained ≈ ninfo / (ninfo + nzero)
+        @test s.masked.alignment ≈ cka(Xi, Yi) atol = 1e-8   # masked == clean subset
+        @test s.delta ≈ s.masked.alignment - s.full.alignment
+        @test occursin("AlignmentSensitivity", sprint(show, s))
+
+        # no zero rows → keep everything, full == masked
+        s2 = alignment_sensitivity(Xi, Yi; nperm=100, rng=MersenneTwister(6))
+        @test s2.frac_retained == 1.0
+        @test s2.full.alignment ≈ s2.masked.alignment atol = 1e-8
+
+        # too-few-informative guard
+        @test_throws Exception alignment_sensitivity(zeros(10, 3), zeros(10, 3); nperm=10)
+
+        # ProfileSet convenience method
+        keys = DataFrame(V=string.(1:(ninfo+nzero)))
+        q = ProfileSet(keys, ["Q$i" for i in 1:n], Mq)
+        r = ProfileSet(keys, ["R$i" for i in 1:n], Mr)
+        sp = alignment_sensitivity(q, r; nperm=100, rng=MersenneTwister(7))
+        @test sp.n_variants_masked == ninfo
+        @test sp.masked.alignment ≈ cka(Xi, Yi) atol = 1e-8
     end
 
     # ─────────────────────────────────────────────────────────────────────────
