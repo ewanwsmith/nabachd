@@ -22,7 +22,8 @@ using DataFrames
 
 export plot_k_calibration, plot_k_sd, plot_mean_peak, plot_weighted_unweighted,
        plot_ranked, plot_profile_densities, umap_embedding,
-       plot_umap_species, plot_umap_scored, save_all_figures
+       plot_umap_species, plot_umap_scored,
+       plot_panel_alignment, plot_panel_alignments, save_all_figures
 
 CairoMakie.activate!(type="png")
 
@@ -128,6 +129,68 @@ function plot_ranked(scores::DataFrame; n::Int=15)
     fig
 end
 
+# ── panel-level neighbourhood alignment ─────────────────────────────────────
+
+# Draw the permutation-null band (near zero) plus the observed-alignment bar for
+# one PanelAlignment at row `y`. `pa` is duck-typed: any object with the
+# PanelAlignment fields (alignment, null_mean, null_sd, z, p) works.
+function _alignment_row!(ax, pa, y; halfheight=0.35)
+    lo = max(0.0, pa.null_mean - 3 * pa.null_sd)
+    hi = pa.null_mean + 3 * pa.null_sd
+    hi > lo && poly!(ax, Point2f[(lo, y - halfheight), (hi, y - halfheight),
+                                 (hi, y + halfheight), (lo, y + halfheight)];
+                     color=(:gray65, 0.6))
+    barplot!(ax, [y], [pa.alignment]; direction=:x, color=[pa.alignment],
+             colormap=:viridis, colorrange=(0, 1), width=2 * halfheight)
+    text!(ax, pa.alignment, y; text=string(round(pa.alignment, digits=3)),
+          align=(:left, :center), offset=(6, 0), fontsize=12)
+    return nothing
+end
+
+"""
+    plot_panel_alignment(pa; title="Panel neighbourhood alignment")
+
+Single panel-level alignment (a `PanelAlignment`): the observed neighbourhood
+alignment (CKA) as a viridis bar on a 0–1 axis, with the permutation-null band
+(grey, near zero) and the standardised effect / p annotated. `pa` is duck-typed.
+"""
+function plot_panel_alignment(pa; title::AbstractString="Panel neighbourhood alignment")
+    fig = Figure(size=(760, 240))
+    ax = Axis(fig[1, 1]; xlabel="neighbourhood alignment (CKA)", title=title,
+              limits=((0, 1), (0.3, 1.7)))
+    hideydecorations!(ax)
+    _alignment_row!(ax, pa, 1.0)
+    text!(ax, 0.0, 1.62;
+          text="z = $(round(pa.z, digits=1))   p = $(round(pa.p, digits=4))   " *
+               "null ≈ $(round(pa.null_mean, digits=3))   " *
+               "($(pa.weighted ? "frequency-weighted" : "unweighted"), " *
+               "$(pa.n_query)×$(pa.n_reference) alleles)",
+          align=(:left, :center), fontsize=10, color=:gray30)
+    fig
+end
+
+"""
+    plot_panel_alignments(pas, labels; title="Panel neighbourhood alignment")
+
+Compare several panel alignments (`pas`, a vector of `PanelAlignment`) on one
+0–1 axis — e.g. weighting schemes for a pair, or the same scheme across panel
+pairs. Each row shows the observed alignment (viridis bar) over its
+permutation-null band (grey). `labels` are the y-axis row labels.
+"""
+function plot_panel_alignments(pas, labels; title::AbstractString="Panel neighbourhood alignment")
+    n = length(pas)
+    length(labels) == n || error("plot_panel_alignments: labels and pas differ in length")
+    ys = collect(n:-1:1)                         # first entry at the top
+    fig = Figure(size=(780, 78n + 150))
+    ax = Axis(fig[1, 1]; xlabel="neighbourhood alignment (CKA)", title=title,
+              limits=((0, 1), (0.4, n + 0.6)), yticks=(ys, collect(labels)))
+    for (k, pa) in enumerate(pas)
+        _alignment_row!(ax, pa, float(ys[k]))
+    end
+    Colorbar(fig[1, 2]; colormap=:viridis, limits=(0, 1), label="alignment")
+    fig
+end
+
 # ── simulation-value densities (Supp Fig 2A / 2B) ───────────────────────────
 
 """
@@ -211,21 +274,28 @@ function plot_umap_species(emb::AbstractMatrix, is_query::AbstractVector;
 end
 
 """
-    plot_umap_scored(emb, is_query, query_alleles, weighted_r; label_top=15, contours=true)
+    plot_umap_scored(emb, is_query, query_alleles, weighted_r; label_top=15,
+                     contours=true, alignment=nothing)
 
 UMAP with reference alleles in grey (+ density contours) and query alleles
 coloured by weighted neighbourhood r; the `label_top` highest-scoring query
 alleles are labelled (Fig 2B). `weighted_r` must be aligned to `query_alleles`,
-which must be in the same order as the query columns of `emb`.
+which must be in the same order as the query columns of `emb`. If `alignment`
+(a `PanelAlignment`) is given, the panel-level neighbourhood alignment is shown
+as the subtitle — so the per-allele and panel statistics appear on one figure.
 """
 function plot_umap_scored(emb::AbstractMatrix, is_query::AbstractVector,
                           query_alleles::AbstractVector, weighted_r::AbstractVector;
-                          label_top::Int=15, contours::Bool=true)
+                          label_top::Int=15, contours::Bool=true, alignment=nothing)
     rx, ry = emb[1, .!is_query], emb[2, .!is_query]
     qx, qy = emb[1, is_query], emb[2, is_query]
+    sub = alignment === nothing ? "" :
+        "panel neighbourhood alignment (CKA) = $(round(alignment.alignment, digits=3))  " *
+        "(z = $(round(alignment.z, digits=1)), p = $(round(alignment.p, digits=4)); " *
+        "$(alignment.weighted ? "frequency-weighted" : "unweighted"))"
     fig = Figure(size=(760, 620))
     ax = Axis(fig[1, 1]; xlabel="UMAP 1", ylabel="UMAP 2",
-              title="Query alleles by weighted neighbourhood r")
+              title="Query alleles by weighted neighbourhood r", subtitle=sub)
     if contours && length(rx) > 5
         k2 = kde((rx, ry))
         contour!(ax, k2.x, k2.y, k2.density; color=:gray70, linewidth=1)
@@ -279,6 +349,11 @@ function save_all_figures(res, query_profiles, reference_profiles; outdir::Abstr
     _write("mean_vs_peak",           plot_mean_peak(res.scores))
     _write("weighted_vs_unweighted", plot_weighted_unweighted(res.scores))
     _write("ranked_top$(top_n)",     plot_ranked(res.scores; n=top_n))
+    if hasproperty(res, :alignment) && res.alignment !== nothing
+        _write("panel_alignment",
+               plot_panel_alignment(res.alignment;
+                   title="Neighbourhood alignment: $query_label vs $reference_label"))
+    end
     _write("densities_$(query_label)",
            plot_profile_densities(query_profiles.M; color=PURPLE, label=query_label))
     _write("densities_$(reference_label)",
@@ -291,8 +366,10 @@ function save_all_figures(res, query_profiles, reference_profiles; outdir::Abstr
                plot_umap_species(emb, is_q; query_label=query_label, reference_label=reference_label))
         wmap = Dict(res.scores.allele .=> res.scores.weighted_nbhd_r)
         wr = [get(wmap, a, NaN) for a in query_profiles.alleles]
+        pa = hasproperty(res, :alignment) ? res.alignment : nothing
         _write("umap_scored",
-               plot_umap_scored(emb, is_q, query_profiles.alleles, wr; label_top=top_n))
+               plot_umap_scored(emb, is_q, query_profiles.alleles, wr;
+                                label_top=top_n, alignment=pa))
     end
     return written
 end
