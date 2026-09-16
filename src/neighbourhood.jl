@@ -204,12 +204,20 @@ shared variants. The centring step of linear CKA.
 column_center(M::AbstractMatrix) = M .- mean(M, dims=1)
 
 # Scale columns by √w (so XᵀX is the w-weighted Gram). Weights are clamped to be
-# non-negative; a zero weight simply drops that allele from the geometry.
+# non-negative; a zero weight simply drops that allele from the geometry. If a
+# panel's weights are *all* zero (e.g. a frequency file that covers none of its
+# alleles), fall back to uniform (unweighted) for that panel rather than zeroing
+# every column — which would otherwise collapse the alignment to 0.
 function _weight_columns(X::AbstractMatrix, w)
     w === nothing && return X
     length(w) == size(X, 2) ||
         error("cka: weight length $(length(w)) ≠ number of alleles $(size(X, 2))")
-    X .* sqrt.(clamp.(Float64.(w), 0.0, Inf))'
+    ww = clamp.(Float64.(w), 0.0, Inf)
+    if all(iszero, ww)
+        @warn "cka: all weights are zero for a panel (frequency file covers none of its alleles); using uniform weights for that panel"
+        return X
+    end
+    X .* sqrt.(ww)'
 end
 
 # CKA from already centred (+ weighted) matrices. Kept separate so the

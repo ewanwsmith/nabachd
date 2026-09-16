@@ -354,6 +354,12 @@ Random.seed!(1234)   # determinism for the randomised fixtures below
         # dimension guard
         @test_throws Exception cka(randn(rng, 10, 2), randn(rng, 9, 2))
         @test_throws Exception cka(X, X; wq=ones(n + 1))        # bad weight length
+
+        # all-zero weights on a panel fall back to uniform (no collapse to 0), with a warning
+        z1 = @test_logs (:warn,) match_mode = :any cka(X, X; wq=zeros(n))
+        @test z1 ≈ 1.0 atol = 1e-8
+        z2 = @test_logs (:warn,) match_mode = :any cka(X, Yr; wq=zeros(n))
+        @test z2 ≈ cka(X, Yr) atol = 1e-8       # query all-zero → unweighted query
     end
 
     # ─────────────────────────────────────────────────────────────────────────
