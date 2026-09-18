@@ -91,6 +91,13 @@ METHOD:
     --sensitivity              Also run the zero-inflation sensitivity check:
                                recompute the alignment on informative variants
                                only and report the difference.
+    --leave-one-out            Per-allele sensitivity check: for each query allele,
+                               exclude reference alleles sharing its normalised name
+                               before computing its neighbourhood r (off by default).
+    --drop-shared              Panel-level sensitivity check: remove alleles common
+                               to both panels before computing the CKA alignment
+                               (off by default). Shared-allele diagnostics are
+                               reported either way.
     --mask-mode <m>            Which panel must show binding signal for a variant
                                to be kept: either|both|query|reference (default either).
     --mask-threshold <float>   Peak |escape| above which a variant counts as
@@ -194,16 +201,25 @@ nperm = parse(Int, getflag(argv, "--nperm"; default="1000"))
 sensitivity = hasflag(argv, "--sensitivity")
 mask_mode = Symbol(getflag(argv, "--mask-mode"; default="either"))
 mask_threshold = parse(Float64, getflag(argv, "--mask-threshold"; default="0.0"))
+leave_one_out = hasflag(argv, "--leave-one-out")
+drop_shared = hasflag(argv, "--drop-shared")
 
 println("Running analysis ...")
 res = analyse(query, reference; frequencies=freqs, k=k, fisher=fisher,
-              panel=panel, nperm=nperm)
+              panel=panel, nperm=nperm,
+              leave_one_out=leave_one_out, drop_shared=drop_shared)
 println("  neighbourhood size k = ", res.k)
 if res.alignment !== nothing
     a = res.alignment
     println("  panel neighbourhood alignment = ", round(a.alignment, digits=4),
             "  (z = ", round(a.z, digits=2), ", p = ", a.p,
             a.weighted ? ", frequency-weighted)" : ", unweighted)")
+    if a.n_shared > 0
+        println("  shared alleles = ", a.n_shared,
+                "  (", round(100 * a.frac_shared_query, digits=1), "% of query, ",
+                round(100 * a.frac_shared_reference, digits=1), "% of reference",
+                a.drop_shared ? "; excluded before CKA)" : "; retained)")
+    end
 end
 
 sens = nothing
