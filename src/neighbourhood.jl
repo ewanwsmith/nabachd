@@ -138,35 +138,69 @@ function find_k_star(R::AbstractMatrix; k_seq=default_k_sequence(size(R, 2)))
 end
 
 """
-    neighbourhood_scores(R, query_alleles, reference_alleles, freq; k, fisher=true) -> DataFrame
+    neighbourhood_scores(R, query_alleles, reference_alleles, freq; k,
+                         fisher=true, leave_one_out=false) -> DataFrame
 
 Compute per-query-allele summary statistics and neighbourhood scores. Returns a
 DataFrame sorted by descending weighted neighbourhood r, with columns:
-`allele, k, peak_r, mean_r, nbhd_r, weighted_nbhd_r, nearest_reference, nearest_r`.
+`allele, k, peak_r, mean_r, nbhd_r, weighted_nbhd_r, nearest_reference, nearest_r,
+shared, nearest_is_self`.
 
 - `nbhd_r`          — unweighted top-k mean correlation
 - `weighted_nbhd_r` — frequency-weighted, Fisher-z top-k mean (primary metric)
 - `nearest_reference`/`nearest_r` — closest single reference allele and its r
+  (always over the full reference, not affected by `leave_one_out`)
+- `shared`          — `true` when the query allele's normalised name appears in
+                      the reference panel (diagnostic, always computed)
+- `nearest_is_self` — `true` when the nearest reference allele is a name-match
+                      for this query allele (flags potential self-inflation)
+- `leave_one_out`   — when `true`, exclude reference alleles whose normalised
+                      name matches the query allele before computing `nbhd_r` and
+                      `weighted_nbhd_r`; `k` in the output reflects the effective
+                      neighbourhood size used (may be < requested `k` only when
+                      fewer than `k` non-matching reference alleles exist)
 """
 function neighbourhood_scores(R::AbstractMatrix, query_alleles::AbstractVector,
                               reference_alleles::AbstractVector, freq::AbstractVector;
-                              k::Int, fisher::Bool=true)
+                              k::Int, fisher::Bool=true, leave_one_out::Bool=false)
     n_q, n_ref = size(R)
     n_q == length(query_alleles) ||
         error("neighbourhood_scores: R rows ($n_q) ≠ query alleles ($(length(query_alleles)))")
     n_ref == length(reference_alleles) == length(freq) ||
         error("neighbourhood_scores: R cols ($n_ref) must match reference alleles and freq")
 
+    norm_ref     = normalise_allele.(reference_alleles)
+    norm_ref_set = Set(norm_ref)
+
     out = DataFrame(allele=String[], k=Int[], peak_r=Float64[], mean_r=Float64[],
                     nbhd_r=Float64[], weighted_nbhd_r=Float64[],
-                    nearest_reference=String[], nearest_r=Float64[])
+                    nearest_reference=String[], nearest_r=Float64[],
+                    shared=Bool[], nearest_is_self=Bool[])
     for i in 1:n_q
-        r = R[i, :]
+        r     = R[i, :]
         jbest = argmax(r)
-        push!(out, (string(query_alleles[i]), k, maximum(r), mean(r),
-                    topk_mean(r, k),
-                    weighted_neighbourhood_r(r, freq, k; fisher=fisher),
-                    string(reference_alleles[jbest]), r[jbest]))
+        qnorm = normalise_allele(query_alleles[i])
+
+        is_shared       = qnorm ∈ norm_ref_set
+        nearest_is_self = norm_ref[jbest] == qnorm
+
+        if leave_one_out && is_shared
+            keep  = findall(j -> norm_ref[j] != qnorm, 1:n_ref)
+            r_loo = r[keep]
+            f_loo = freq[keep]
+            k_eff = min(k, length(keep))
+        else
+            r_loo = r
+            f_loo = freq
+            k_eff = k
+        end
+
+        push!(out, (string(query_alleles[i]), k_eff,
+                    maximum(r), mean(r),
+                    topk_mean(r_loo, k_eff),
+                    weighted_neighbourhood_r(r_loo, f_loo, k_eff; fisher=fisher),
+                    string(reference_alleles[jbest]), r[jbest],
+                    is_shared, nearest_is_self))
     end
     sort!(out, :weighted_nbhd_r, rev=true)
     return out
@@ -245,19 +279,83 @@ function cka(Mq::AbstractMatrix, Mr::AbstractMatrix; wq=nothing, wr=nothing)
          _weight_columns(column_center(Mr), wr))
 end
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared-allele diagnostics.
+#
+# When two panels overlap (alleles with the same normalised name appear in both),
+# there are two effects:
+#   • per-allele: the nearest reference neighbour for a shared query allele may
+#     be itself, inflating weighted_nbhd_r. `leave_one_out=true` in
+#     `neighbourhood_scores` removes these matches before computing the score.
+#   • panel: shared alleles contribute identically to both Gram matrices,
+#     mechanically increasing CKA regardless of the panels' biological
+#     similarity. `drop_shared=true` in `panel_alignment` removes them first.
+#
+# Both flags are **off by default** — shared alleles are a legitimate signal
+# (they force a minimum alignment reflecting the shared portion of the repertoire,
+# which is itself meaningful). The flags are for sensitivity checks and for
+# comparisons where shared alleles would make the result trivially high.
+#
+# Shared-allele statistics are **always reported** (they cost nothing to compute)
+# so the user can judge whether to apply the flags.
+
+# Internal: compute shared-allele overlap statistics from allele-name vectors and
+# (optionally) weight vectors. n_query / n_reference are the ORIGINAL panel sizes
+# (used as denominators); if weights are provided they should be aligned to the
+# ORIGINAL allele vectors (before any dropping).
+function _shared_info(query_alleles, reference_alleles, wq, wr, n_query, n_reference)
+    (query_alleles === nothing || reference_alleles === nothing) &&
+        return (n_shared=0, frac_shared_query=0.0, frac_shared_reference=0.0,
+                frac_shared_query_weighted=0.0, frac_shared_reference_weighted=0.0)
+    qnorm = normalise_allele.(query_alleles)
+    rnorm = normalise_allele.(reference_alleles)
+    shared_set = intersect(Set(qnorm), Set(rnorm))
+    n_sh = length(shared_set)
+    fq   = n_sh / max(1, n_query)
+    fr   = n_sh / max(1, n_reference)
+    # frequency-weighted fractions: shared allele weight / total weight
+    if wq !== nothing
+        wq_total = sum(wq)
+        fqw = wq_total > 0 ?
+            sum(w for (w, nm) in zip(wq, qnorm) if nm ∈ shared_set; init=0.0) / wq_total : fq
+    else
+        fqw = fq
+    end
+    if wr !== nothing
+        wr_total = sum(wr)
+        frw = wr_total > 0 ?
+            sum(w for (w, nm) in zip(wr, rnorm) if nm ∈ shared_set; init=0.0) / wr_total : fr
+    else
+        frw = fr
+    end
+    return (n_shared=n_sh, frac_shared_query=fq, frac_shared_reference=fr,
+            frac_shared_query_weighted=fqw, frac_shared_reference_weighted=frw)
+end
+
 """
     PanelAlignment
 
 Panel-level neighbourhood alignment — a single frequency-weighted CKA between a
 query and reference panel with its permutation-null significance.
 
-- `alignment`  — frequency-weighted linear CKA in [0, 1] (**primary panel metric**)
+**Primary metric:**
+- `alignment`  — frequency-weighted linear CKA in [0, 1]
 - `p`          — one-sided empirical p, `P(null ≥ observed)`
 - `z`          — standardised effect `(observed − null mean) / null sd`;
                  comparable across panel pairs of different sizes
 - `null_mean`, `null_sd`, `nperm` — the permutation-null summary
-- `weighted`   — whether carrier frequencies were applied
+
+**Panel metadata:**
+- `weighted`       — whether carrier frequencies were applied
 - `n_query`, `n_reference`, `n_variants` — the aligned panel dimensions
+- `drop_shared`    — whether shared alleles were excluded before computing
+
+**Shared-allele diagnostics** (always populated; 0 / 0.0 when names unavailable):
+- `n_shared`                    — alleles with the same normalised name in both panels
+- `frac_shared_query`           — n_shared / n_query (unweighted)
+- `frac_shared_reference`       — n_shared / n_reference (unweighted)
+- `frac_shared_query_weighted`  — shared allele frequency / total query frequency
+- `frac_shared_reference_weighted` — same for the reference panel
 """
 struct PanelAlignment
     alignment::Float64
@@ -270,18 +368,30 @@ struct PanelAlignment
     n_query::Int
     n_reference::Int
     n_variants::Int
+    drop_shared::Bool
+    n_shared::Int
+    frac_shared_query::Float64
+    frac_shared_reference::Float64
+    frac_shared_query_weighted::Float64
+    frac_shared_reference_weighted::Float64
 end
 
 Base.show(io::IO, pa::PanelAlignment) = print(io,
     "PanelAlignment(alignment=$(round(pa.alignment, digits=4)), " *
     "z=$(round(pa.z, digits=2)), p=$(pa.p), " *
     "$(pa.weighted ? "frequency-weighted" : "unweighted"), " *
-    "$(pa.n_query)×$(pa.n_reference) alleles, $(pa.n_variants) variants)")
+    "$(pa.n_query)×$(pa.n_reference) alleles, $(pa.n_variants) variants" *
+    (pa.n_shared > 0 ?
+        ", $(pa.n_shared) shared ($(round(100*pa.frac_shared_query, digits=1))% Q / $(round(100*pa.frac_shared_reference, digits=1))% R)" :
+        "") *
+    (pa.drop_shared ? " [shared alleles excluded]" : "") * ")")
 
 """
     panel_alignment(Mq, Mr; wq=nothing, wr=nothing, nperm=1000,
                     rng=Random.default_rng(), weighted=false,
-                    n_query=size(Mq,2), n_reference=size(Mr,2)) -> PanelAlignment
+                    n_query=size(Mq,2), n_reference=size(Mr,2),
+                    query_alleles=nothing, reference_alleles=nothing,
+                    drop_shared=false) -> PanelAlignment
 
 Neighbourhood alignment between two aligned escape-profile matrices, with a
 permutation null. The null shuffles the reference's variant rows relative to the
@@ -289,15 +399,48 @@ query — breaking the variant alignment while preserving each panel's own
 structure. A row permutation leaves each panel's own Gram matrix unchanged, so
 the denominator is computed once and only the cross term is recomputed per
 permutation. Returns a [`PanelAlignment`](@ref).
+
+**Shared-allele handling:**
+- `query_alleles` / `reference_alleles` — allele name vectors aligned to the
+  columns of `Mq` / `Mr`. When provided, shared-allele statistics are reported
+  in the result even when `drop_shared=false`.
+- `drop_shared=true` — remove alleles whose normalised name appears in both
+  panels *before* computing the alignment. Requires `query_alleles` and
+  `reference_alleles`. Shared-allele statistics always reflect the *original*
+  panel sizes (before dropping), so the effect of the flag is legible from the
+  difference in the scores.
 """
 function panel_alignment(Mq::AbstractMatrix, Mr::AbstractMatrix;
                          wq=nothing, wr=nothing, nperm::Int=1000,
                          rng=Random.default_rng(), weighted::Bool=false,
-                         n_query::Int=size(Mq, 2), n_reference::Int=size(Mr, 2))
+                         n_query::Int=size(Mq, 2), n_reference::Int=size(Mr, 2),
+                         query_alleles=nothing, reference_alleles=nothing,
+                         drop_shared::Bool=false)
     size(Mq, 1) == size(Mr, 1) ||
         error("panel_alignment: query and reference have different variant counts")
-    Xc = _weight_columns(column_center(Mq), wq)
-    Yc = _weight_columns(column_center(Mr), wr)
+
+    # ── shared-allele diagnostics (always computed from original allele lists) ──
+    si = _shared_info(query_alleles, reference_alleles, wq, wr, n_query, n_reference)
+
+    # ── optional: drop shared alleles from both panels before CKA ──────────────
+    Mq_use, Mr_use, wq_use, wr_use = Mq, Mr, wq, wr
+    if drop_shared && query_alleles !== nothing && reference_alleles !== nothing && si.n_shared > 0
+        qnorm = normalise_allele.(query_alleles)
+        rnorm = normalise_allele.(reference_alleles)
+        shared_set = intersect(Set(qnorm), Set(rnorm))
+        keep_q = findall(nm -> nm ∉ shared_set, qnorm)
+        keep_r = findall(nm -> nm ∉ shared_set, rnorm)
+        isempty(keep_q) && error("panel_alignment: drop_shared removed all query alleles")
+        isempty(keep_r) && error("panel_alignment: drop_shared removed all reference alleles")
+        Mq_use = Mq[:, keep_q]
+        Mr_use = Mr[:, keep_r]
+        wq_use = wq !== nothing ? wq[keep_q] : nothing
+        wr_use = wr !== nothing ? wr[keep_r] : nothing
+    end
+
+    # ── CKA + permutation null ──────────────────────────────────────────────────
+    Xc = _weight_columns(column_center(Mq_use), wq_use)
+    Yc = _weight_columns(column_center(Mr_use), wr_use)
     obs = _cka(Xc, Yc)
     m   = size(Xc, 1)
     den = sqrt(sum(abs2, Xc'Xc)) * sqrt(sum(abs2, Yc'Yc))   # invariant to row perm
@@ -309,27 +452,35 @@ function panel_alignment(Mq::AbstractMatrix, Mr::AbstractMatrix;
     p = (count(>=(obs), null) + 1) / (nperm + 1)
     μ = mean(null); σ = std(null)
     z = σ > 0 ? (obs - μ) / σ : 0.0
-    PanelAlignment(obs, p, z, μ, σ, nperm, weighted, n_query, n_reference, m)
+
+    PanelAlignment(obs, p, z, μ, σ, nperm, weighted, n_query, n_reference, m,
+                   drop_shared, si.n_shared, si.frac_shared_query,
+                   si.frac_shared_reference, si.frac_shared_query_weighted,
+                   si.frac_shared_reference_weighted)
 end
 
 """
     panel_alignment(query::ProfileSet, reference::ProfileSet;
-                    frequencies=nothing, nperm=1000, rng=Random.default_rng())
+                    frequencies=nothing, nperm=1000, rng=Random.default_rng(),
+                    drop_shared=false)
 
 Convenience method: align `query` and `reference` on their shared variants and
 compute the neighbourhood alignment. With `frequencies` (a `Dict` from
 `load_frequencies`, keyed across both panels) both sides are weighted by carrier
-frequency; without it the alignment is unweighted.
+frequency; without it the alignment is unweighted. Set `drop_shared=true` to
+exclude alleles shared between the two panels before computing.
 """
 function panel_alignment(query::ProfileSet, reference::ProfileSet;
                          frequencies=nothing, nperm::Int=1000,
-                         rng=Random.default_rng())
+                         rng=Random.default_rng(), drop_shared::Bool=false)
     Mq, Mr = align_profiles(query, reference)
     weighted = frequencies !== nothing
     wq = weighted ? frequency_vector(query, frequencies)     : nothing
     wr = weighted ? frequency_vector(reference, frequencies) : nothing
     panel_alignment(Mq, Mr; wq=wq, wr=wr, nperm=nperm, rng=rng, weighted=weighted,
-                    n_query=nalleles(query), n_reference=nalleles(reference))
+                    n_query=nalleles(query), n_reference=nalleles(reference),
+                    query_alleles=query.alleles, reference_alleles=reference.alleles,
+                    drop_shared=drop_shared)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -407,27 +558,37 @@ Base.show(io::IO, s::AlignmentSensitivity) = print(io,
     alignment_sensitivity(Mq, Mr; wq=nothing, wr=nothing, threshold=0.0,
                           mode=:either, nperm=1000, rng=Random.default_rng(),
                           weighted=false, n_query=size(Mq,2),
-                          n_reference=size(Mr,2)) -> AlignmentSensitivity
+                          n_reference=size(Mr,2),
+                          query_alleles=nothing, reference_alleles=nothing,
+                          drop_shared=false) -> AlignmentSensitivity
 
 Compute the neighbourhood alignment on all shared variants and again on the
 informative variants only (see [`informative_variants`](@ref)), returning both
 with the fraction of variants retained and their difference. The masked run uses
 the same weights, permutation count and RNG so the two are directly comparable.
+`query_alleles`, `reference_alleles`, and `drop_shared` are forwarded to
+`panel_alignment` (shared-allele diagnostics appear in both `full` and `masked`).
 """
 function alignment_sensitivity(Mq::AbstractMatrix, Mr::AbstractMatrix;
                                wq=nothing, wr=nothing, threshold::Real=0.0,
                                mode::Symbol=:either, nperm::Int=1000,
                                rng=Random.default_rng(), weighted::Bool=false,
-                               n_query::Int=size(Mq, 2), n_reference::Int=size(Mr, 2))
+                               n_query::Int=size(Mq, 2), n_reference::Int=size(Mr, 2),
+                               query_alleles=nothing, reference_alleles=nothing,
+                               drop_shared::Bool=false)
     full = panel_alignment(Mq, Mr; wq=wq, wr=wr, nperm=nperm, rng=rng,
-                           weighted=weighted, n_query=n_query, n_reference=n_reference)
+                           weighted=weighted, n_query=n_query, n_reference=n_reference,
+                           query_alleles=query_alleles, reference_alleles=reference_alleles,
+                           drop_shared=drop_shared)
     mask = informative_variants(Mq, Mr; threshold=threshold, mode=mode)
     keep = count(mask)
     keep >= 2 ||
         error("alignment_sensitivity: only $keep informative variant(s) at threshold=$threshold, mode=:$mode")
     masked = panel_alignment(Mq[mask, :], Mr[mask, :]; wq=wq, wr=wr, nperm=nperm,
                              rng=rng, weighted=weighted, n_query=n_query,
-                             n_reference=n_reference)
+                             n_reference=n_reference,
+                             query_alleles=query_alleles, reference_alleles=reference_alleles,
+                             drop_shared=drop_shared)
     AlignmentSensitivity(full, masked, mode, Float64(threshold), size(Mq, 1), keep,
                          keep / size(Mq, 1), masked.alignment - full.alignment)
 end
@@ -435,21 +596,25 @@ end
 """
     alignment_sensitivity(query::ProfileSet, reference::ProfileSet;
                           frequencies=nothing, threshold=0.0, mode=:either,
-                          nperm=1000, rng=Random.default_rng())
+                          nperm=1000, rng=Random.default_rng(),
+                          drop_shared=false)
 
 Convenience method: align `query` and `reference` on their shared variants, then
 run the zero-inflation sensitivity check. `frequencies` weights both panels by
-carrier frequency, as in [`panel_alignment`](@ref).
+carrier frequency, as in [`panel_alignment`](@ref). Set `drop_shared=true` to
+exclude shared alleles before computing (forwarded to both `panel_alignment` calls).
 """
 function alignment_sensitivity(query::ProfileSet, reference::ProfileSet;
                                frequencies=nothing, threshold::Real=0.0,
                                mode::Symbol=:either, nperm::Int=1000,
-                               rng=Random.default_rng())
+                               rng=Random.default_rng(), drop_shared::Bool=false)
     Mq, Mr = align_profiles(query, reference)
     weighted = frequencies !== nothing
     wq = weighted ? frequency_vector(query, frequencies)     : nothing
     wr = weighted ? frequency_vector(reference, frequencies) : nothing
     alignment_sensitivity(Mq, Mr; wq=wq, wr=wr, threshold=threshold, mode=mode,
                           nperm=nperm, rng=rng, weighted=weighted,
-                          n_query=nalleles(query), n_reference=nalleles(reference))
+                          n_query=nalleles(query), n_reference=nalleles(reference),
+                          query_alleles=query.alleles, reference_alleles=reference.alleles,
+                          drop_shared=drop_shared)
 end

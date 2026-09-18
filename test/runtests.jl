@@ -114,7 +114,8 @@ Random.seed!(1234)   # determinism for the randomised fixtures below
         qa = ["Q1", "Q2"]; ra = ["R1", "R2", "R3"]
         sc = neighbourhood_scores(R, qa, ra, freq; k=2)
         @test names(sc) == ["allele", "k", "peak_r", "mean_r", "nbhd_r",
-                            "weighted_nbhd_r", "nearest_reference", "nearest_r"]
+                            "weighted_nbhd_r", "nearest_reference", "nearest_r",
+                            "shared", "nearest_is_self"]
         @test issorted(sc.weighted_nbhd_r, rev=true)
         @test all(sc.peak_r .>= sc.mean_r)
         @test all(sc.peak_r .>= sc.nbhd_r)                 # top-k mean ≤ max
@@ -460,4 +461,91 @@ Random.seed!(1234)   # determinism for the randomised fixtures below
         nb = analyse(q, r; k=1)
         @test occursin("Neighbourhood", sprint(show, nb))
     end
+    # ─────────────────────────────────────────────────────────────────────────
+    @testset "neighbourhood_scores: shared diagnostics + leave_one_out" begin
+        # build a small R matrix where Q1 matches R1 (shared) and Q2 has no match
+        R = [0.95 0.50 0.10;
+             0.20 0.85 0.70]
+        freq = [1.0, 2.0, 1.0]
+        qa = ["Q1", "Q2"]
+        ra = ["Q1", "R2", "R3"]   # R1 is named Q1 → shared with query allele 1
+
+        sc = neighbourhood_scores(R, qa, ra, freq; k=2)
+        # shared column: Q1 is in ra, Q2 is not
+        row_q1 = sc[sc.allele .== "Q1", :][1, :]
+        row_q2 = sc[sc.allele .== "Q2", :][1, :]
+        @test row_q1.shared == true
+        @test row_q2.shared == false
+        # nearest_is_self: argmax(R[1,:]) == 1 (r=0.95) → reference is "Q1" → self
+        @test row_q1.nearest_is_self == true
+        @test row_q2.nearest_is_self == false
+
+        # leave_one_out: Q1 excludes its name-match (column 1) before scoring
+        sc_loo = neighbourhood_scores(R, qa, ra, freq; k=2, leave_one_out=true)
+        row_q1_loo = sc_loo[sc_loo.allele .== "Q1", :][1, :]
+        row_q2_loo = sc_loo[sc_loo.allele .== "Q2", :][1, :]
+        # LOO removes the highest correlation for Q1, so nbhd_r must decrease
+        @test row_q1_loo.nbhd_r < row_q1.nbhd_r
+        # Q2 has no shared allele so LOO doesn't change its score
+        @test row_q2_loo.nbhd_r ≈ row_q2.nbhd_r atol = 1e-10
+        # nearest_reference and nearest_r still use the full row (unfiltered)
+        @test row_q1_loo.nearest_reference == "Q1"
+        @test row_q1_loo.nearest_r ≈ 0.95 atol = 1e-10
+    end
+
+    # ─────────────────────────────────────────────────────────────────────────
+    @testset "panel_alignment: shared diagnostics + drop_shared" begin
+        rng = MersenneTwister(77)
+        m, nq, nr = 300, 4, 6
+        X = randn(rng, m, nq)
+        Y = randn(rng, m, nr)
+        qa = ["A1", "A2", "SHARED1", "SHARED2"]
+        ra = ["SHARED1", "SHARED2", "B1", "B2", "B3", "B4"]
+
+        # ── no allele names → n_shared = 0 ───────────────────────────────────
+        pa_nonames = panel_alignment(X, Y; nperm=50, rng=MersenneTwister(1))
+        @test pa_nonames.n_shared == 0
+        @test pa_nonames.frac_shared_query == 0.0
+        @test pa_nonames.frac_shared_reference == 0.0
+        @test pa_nonames.drop_shared == false
+
+        # ── with allele names, shared stats are correct ───────────────────────
+        pa_named = panel_alignment(X, Y; nperm=50, rng=MersenneTwister(2),
+                                   query_alleles=qa, reference_alleles=ra,
+                                   n_query=nq, n_reference=nr)
+        @test pa_named.n_shared == 2
+        @test pa_named.frac_shared_query ≈ 2/4 atol = 1e-10
+        @test pa_named.frac_shared_reference ≈ 2/6 atol = 1e-10
+        @test pa_named.drop_shared == false
+        # show includes shared count when n_shared > 0
+        @test occursin("2 shared", sprint(show, pa_named))
+
+        # ── drop_shared removes the 2 shared alleles from both sides ──────────
+        pa_drop = panel_alignment(X, Y; nperm=50, rng=MersenneTwister(3),
+                                  query_alleles=qa, reference_alleles=ra,
+                                  n_query=nq, n_reference=nr, drop_shared=true)
+        @test pa_drop.drop_shared == true
+        @test pa_drop.n_shared == 2              # still reports original shared count
+        # computed on 2 query + 4 reference alleles (shared excluded)
+        X_nonshared = X[:, 1:2]
+        Y_nonshared = Y[:, 3:6]
+        @test pa_drop.alignment ≈ cka(X_nonshared, Y_nonshared) atol = 1e-8
+        # drop_shared when panels have no overlap → identity (no columns removed)
+        qa2 = ["A1", "A2", "A3", "A4"]
+        pa_nodrop = panel_alignment(X, Y; nperm=50, rng=MersenneTwister(4),
+                                    query_alleles=qa2, reference_alleles=ra,
+                                    n_query=nq, n_reference=nr, drop_shared=true)
+        @test pa_nodrop.alignment ≈ cka(X, Y) atol = 1e-8
+        @test pa_nodrop.n_shared == 0
+        # ProfileSet convenience: allele names flow through automatically
+        keys = DataFrame(V=string.(1:m))
+        q_ps = ProfileSet(keys, qa, X)
+        r_ps = ProfileSet(keys, ra, Y)
+        pa_ps = panel_alignment(q_ps, r_ps; nperm=50, rng=MersenneTwister(5))
+        @test pa_ps.n_shared == 2
+        pa_ps_drop = panel_alignment(q_ps, r_ps; nperm=50, rng=MersenneTwister(6), drop_shared=true)
+        @test pa_ps_drop.alignment ≈ cka(X_nonshared, Y_nonshared) atol = 1e-8
+    end
+
+
 end

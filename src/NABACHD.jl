@@ -60,7 +60,8 @@ export ProfileSet, nvariants, nalleles,
 
 Result of an `analyse` run:
 
-- `scores::DataFrame`       — per query allele, ranked by weighted neighbourhood r
+- `scores::DataFrame`       — per query allele, ranked by weighted neighbourhood r;
+                              always includes `shared` and `nearest_is_self` columns
 - `calibration::DataFrame`  — the k-sweep table (`k, cor_peak, cor_mean, sd_topk`)
 - `k::Int`                  — neighbourhood size used
 - `R::Matrix{Float64}`      — query × reference correlation matrix
@@ -88,24 +89,37 @@ Base.show(io::IO, n::Neighbourhood) = print(io,
 
 """
     analyse(query::ProfileSet, reference::ProfileSet;
-            frequencies=nothing, k=:auto, fisher=true, k_seq=nothing) -> Neighbourhood
+            frequencies=nothing, k=:auto, fisher=true, k_seq=nothing,
+            panel=true, nperm=1000, rng=Random.default_rng(),
+            leave_one_out=false, drop_shared=false) -> Neighbourhood
 
 Run the full neighbourhood analysis.
 
-- `frequencies` — a `Dict` from `load_frequencies`, or `nothing` for an
-                  unweighted analysis (uniform weights).
-- `k`           — `:auto` to select k* by the crossover criterion, or an integer
-                  to fix the neighbourhood size.
-- `fisher`      — Fisher z-average the weighted metric (default `true`).
-- `k_seq`       — optional explicit k sweep for calibration.
-- `panel`       — also compute the panel-level neighbourhood alignment
-                  (frequency-weighted CKA + permutation null); default `true`.
-- `nperm`       — permutations for the alignment null (default `1000`).
-- `rng`         — RNG for the permutation null.
+- `frequencies`  — a `Dict` from `load_frequencies`, or `nothing` for an
+                   unweighted analysis (uniform weights).
+- `k`            — `:auto` to select k* by the crossover criterion, or an integer
+                   to fix the neighbourhood size.
+- `fisher`       — Fisher z-average the weighted metric (default `true`).
+- `k_seq`        — optional explicit k sweep for calibration.
+- `panel`        — also compute the panel-level neighbourhood alignment
+                   (frequency-weighted CKA + permutation null); default `true`.
+- `nperm`        — permutations for the alignment null (default `1000`).
+- `rng`          — RNG for the permutation null.
+
+**Shared-allele flags** (off by default; both report diagnostics regardless):
+- `leave_one_out` — for each query allele, exclude any reference allele whose
+                    normalised name matches it before computing `weighted_nbhd_r`.
+                    Use when the same allele appears in both panels and
+                    self-matching would inflate per-allele scores.
+- `drop_shared`  — for the panel metric (CKA), remove alleles shared between
+                   panels before computing. Use when shared alleles would make
+                   the panel alignment trivially high. Requires the panel metric
+                   to be active (`panel=true`).
 """
 function analyse(query::ProfileSet, reference::ProfileSet;
                  frequencies=nothing, k=:auto, fisher::Bool=true, k_seq=nothing,
-                 panel::Bool=true, nperm::Int=1000, rng=Random.default_rng())
+                 panel::Bool=true, nperm::Int=1000, rng=Random.default_rng(),
+                 leave_one_out::Bool=false, drop_shared::Bool=false)
     Mq, Mr = align_profiles(query, reference)
     # warn about alleles with no binding variation across the shared variants:
     # their correlations are undefined and will be treated as 0.
@@ -124,14 +138,16 @@ function analyse(query::ProfileSet, reference::ProfileSet;
 
     freq = frequency_vector(reference, frequencies)
     scores = neighbourhood_scores(R, query.alleles, reference.alleles, freq;
-                                  k=k_used, fisher=fisher)
+                                  k=k_used, fisher=fisher, leave_one_out=leave_one_out)
 
     alignment = if panel
         wq = frequencies === nothing ? nothing : frequency_vector(query, frequencies)
         wr = frequencies === nothing ? nothing : freq   # reference weights already computed
         panel_alignment(Mq, Mr; wq=wq, wr=wr, nperm=nperm, rng=rng,
                         weighted=(frequencies !== nothing),
-                        n_query=nalleles(query), n_reference=nalleles(reference))
+                        n_query=nalleles(query), n_reference=nalleles(reference),
+                        query_alleles=query.alleles, reference_alleles=reference.alleles,
+                        drop_shared=drop_shared)
     else
         nothing
     end
