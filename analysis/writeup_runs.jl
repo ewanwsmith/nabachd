@@ -1,0 +1,586 @@
+#!/usr/bin/env julia
+#
+# Writeup analyses for the nabachd methods paper.
+#
+#   Part 1  per-allele neighbourhood score — BoLA alleles against the human
+#           (HLA) panel, per influenza segment. nabachd's first method.
+#   Part 2  symmetric panel alignment (weighted CKA + permutation null) for all
+#           three pairings: BoLA–HLA, BoLA–SLA, SLA–HLA. The swine–human pair is
+#           the baseline that does not involve cattle, so it says how much of
+#           BoLA–HLA is generic MHC-I structure.
+#   Part 3  overlap demonstration — UK vs US stem-cell-registry panels
+#           (SARS-CoV-2), which share 406 alleles. Shows the metric behaves when
+#           panels overlap. drop_shared stays FALSE: overlap between two registry
+#           panels of the same species is real population structure, and dropping
+#           it would leave a biased residual (the rarer population-specific tail).
+#
+#   Part 4  pooled across segments, within-segment centred — one alignment per
+#           pairing over all eight segments at once, plus a pooled per-allele
+#           run with a single k. See the note above part4() for why the
+#           centring is done per segment block.
+#
+# Usage (from the repo root):
+#   julia --project=. analysis/writeup_runs.jl 1
+#   julia --project=. analysis/writeup_runs.jl 2
+#   julia --project=. analysis/writeup_runs.jl 3
+#   julia --project=. analysis/writeup_runs.jl 4
+#   julia --project=. analysis/writeup_runs.jl all
+#
+# Results are written to RESULTS below, one CSV per part.
+
+include(joinpath(@__DIR__, "..", "src", "NABACHD.jl"))
+using .NABACHD
+using DataFrames, CSV, Random, Statistics
+using LinearAlgebra: BLAS
+
+# ── paths ────────────────────────────────────────────────────────────────────
+# Overridable from the environment so the driver can be exercised on a staged
+# subset of the data (e.g. in a container) without editing this file.
+const CLUST   = get(ENV, "NABACHD_CLUST",   expanduser("~/Documents/PhD/Cows/Clustering"))        # influenza H5N1
+const HLAN    = get(ENV, "NABACHD_HLAN",    expanduser("~/Documents/PhD/HLA-neighbourhoods"))     # SARS-CoV-2
+const RESULTS = get(ENV, "NABACHD_RESULTS", expanduser("~/Documents/PhD/nabachd_writeup/results"))
+
+const SEGMENTS = haskey(ENV, "NABACHD_SEGMENTS") ?
+    String.(split(ENV["NABACHD_SEGMENTS"], ",")) :
+    ["HA", "MP", "NA", "NP", "NS", "PA", "PB1", "PB2"]
+
+# Frequency files (see the handover for provenance).
+const FREQ_HLA  = joinpath(CLUST, "supertype_panel.csv")               # 2080 alleles
+const FREQ_SLA  = joinpath(CLUST, "sla_supertype_panel.csv")           #   35 alleles
+# Rebuilt 2026-10-05: 18 alleles, one row each, direct carrier counting from the
+# 72 Canadian Holstein bulls. Adds BoLA-3:01701 (A11 gene 3), which the previous
+# file omitted, and replaces frequencies that had been read off Figure 1 of
+# Codner et al. 2012 (Animal Genetics). See Cows/Clustering/cattle_panel_rebuild_notes.md.
+# The HWE variant, 1-(1-p)^2 on the same counts, is supertype_panel_codner2006_hwe.csv;
+# it differs by <=0.024 and reorders nothing.
+const FREQ_BOLA = joinpath(CLUST, "supertype_panel_codner2006_carrier.csv")   # 18 alleles
+
+# Permutation counts. Parts 1–2 are cheap (a few thousand variants). Part 3 is
+# NOT: the US panel is 2078 alleles × ~58.7k variants, and each permutation is a
+# dense product of that size — budget on the order of 10 s per permutation, so
+# nperm=1000 is hours. Start at 200 to get the number, raise it for the paper.
+# Overridable from the environment so a driver script can raise the count for a
+# final figure without editing this file:
+#   NABACHD_NPERM_PANEL=2000 NABACHD_NPERM_BIG=1000 julia --project=. analysis/writeup_runs.jl all
+const NPERM_PANEL = parse(Int, get(ENV, "NABACHD_NPERM_PANEL", "1000"))
+const NPERM_BIG   = parse(Int, get(ENV, "NABACHD_NPERM_BIG",   "200"))
+
+const SEED = 42
+
+seg_path(seg, suffix="") = joinpath(CLUST, seg * suffix, "per_allele_best_ranks.csv")
+
+function require(path)
+    isfile(path) || error("missing input: $path")
+    path
+end
+
+# ── Part 1 ───────────────────────────────────────────────────────────────────
+# Per-allele neighbourhood score, POOLED over the whole variant set.
+#
+# This reproduces the construction of the earlier HLA-neighbourhoods writeup: one
+# correlation matrix of all 127 BoLA against all 175 HLA escape profiles across
+# every simulated variant, a single k* chosen once from that matrix, and a
+# frequency-weighted top-k neighbourhood r per BoLA allele. Not per segment —
+# segments are an influenza accident and the method has to work on unsegmented
+# sequences too.
+#
+# Note the asymmetry with Parts 4/5, and keep it: here the 127 BoLA alleles are
+# the SUBJECTS, each receiving a human-relevance score, while HLA is the
+# reference repertoire whose carrier frequencies make that score
+# population-relevant. `weighted_nbhd_r` weights the reference side only, so all
+# 127 catalogue alleles are scored and the 18-allele weighted Codner panel is not
+# the right object here — it is for the panel-level CKA, where both sides are
+# panels.
+function part1()
+    @info "Part 1 — per-allele neighbourhood score, pooled: BoLA query vs HLA reference"
+    freq = load_frequencies(FREQ_HLA; on_duplicate=:error)
+    q = load_cd8scape([require(seg_path(s))           for s in SEGMENTS])   # BoLA
+    r = load_cd8scape([require(seg_path(s, "_human")) for s in SEGMENTS])   # HLA
+    @info "  BoLA: $(nvariants(q)) variants × $(nalleles(q)) alleles; " *
+          "HLA: $(nvariants(r)) variants × $(nalleles(r)) alleles"
+
+    # panel=false: the panel metric is Part 5's job, and skipping it keeps this fast
+    n = analyse(q, r; frequencies=freq, k=:auto, panel=false)
+    out = copy(n.scores)
+    out[!, :k_used] .= n.k
+
+    mkpath(RESULTS)
+    f = joinpath(RESULTS, "part1_per_allele_bola_vs_hla.csv")
+    CSV.write(f, out)
+    @info "  $(nrow(out)) BoLA alleles, k*=$(n.k)"
+    @info "  → $f"
+
+    # The k* calibration curve, so the choice of k can be shown rather than
+    # asserted. k* is where the top-k score stops tracking peak r better than it
+    # tracks mean r — the crossover of the two correlations.
+    Mq, Mr = align_profiles(q, r)
+    cal = calibrate_k(correlation_matrix(Mq, Mr))
+    cal[!, :k_star] .= n.k
+    f2 = joinpath(RESULTS, "part1_k_calibration.csv")
+    CSV.write(f2, cal)
+    @info "  → $f2  ($(nrow(cal)) k values)"
+
+    out
+end
+
+# ── Part 2 ───────────────────────────────────────────────────────────────────
+# Each pairing needs a frequency Dict spanning BOTH panels (panel_alignment
+# weights each side from the same dict), so the per-species dicts are merged.
+# BoLA coverage is sparse (17/127), so the all-zero-weight guard will fall back
+# to uniform weights for the BoLA side and warn — expected, not an error.
+function part2()
+    @info "Part 2 — symmetric panel alignment, three pairings"
+    f_hla, f_sla, f_bola = load_frequencies.((FREQ_HLA, FREQ_SLA, FREQ_BOLA);
+                                             on_duplicate=:error)
+    pairings = [
+        ("BoLA", "HLA", "",       "_human", merge(f_bola, f_hla)),
+        ("BoLA", "SLA", "",       "_swine", merge(f_bola, f_sla)),
+        ("SLA",  "HLA", "_swine", "_human", merge(f_sla,  f_hla)),
+    ]
+    rows = DataFrame()
+    for seg in SEGMENTS, (qn, rn, qsfx, rsfx, freq) in pairings
+        q = load_cd8scape(require(seg_path(seg, qsfx)))
+        r = load_cd8scape(require(seg_path(seg, rsfx)))
+        pa = panel_alignment(q, r; frequencies=freq, nperm=NPERM_PANEL,
+                             rng=MersenneTwister(SEED), drop_shared=false)
+        # Zero-inflation check: recompute on informative variants only. Δ≈0 is
+        # reassuring; a large Δ means the alignment rides on which variants are
+        # active at all rather than on the escape ranking among them.
+        sens = alignment_sensitivity(q, r; frequencies=freq, nperm=NPERM_PANEL,
+                                     rng=MersenneTwister(SEED), drop_shared=false)
+        push!(rows, (segment=seg, query=qn, reference=rn,
+                     alignment=pa.alignment, z=pa.z, p=pa.p,
+                     null_mean=pa.null_mean, null_sd=pa.null_sd,
+                     n_query=pa.n_query, n_reference=pa.n_reference,
+                     n_variants=pa.n_variants, n_shared=pa.n_shared,
+                     sens_delta=sens.delta, frac_retained=sens.frac_retained);
+              promote=true)
+        @info "  $seg $qn→$rn: alignment=$(round(pa.alignment, digits=4)) " *
+              "z=$(round(pa.z, digits=2)) p=$(pa.p) Δsens=$(round(sens.delta, digits=4))"
+    end
+    mkpath(RESULTS)
+    f = joinpath(RESULTS, "part2_panel_alignment.csv")
+    CSV.write(f, rows); @info "  → $f  ($(nrow(rows)) rows)"
+    rows
+end
+
+# ── Part 3 ───────────────────────────────────────────────────────────────────
+function part3(; nperm = NPERM_BIG)
+    @info "Part 3 — overlap demonstration: UK vs US registry panels (SARS-CoV-2)"
+    uk = load_cd8scape(require(joinpath(HLAN, "UK", "per_allele_best_ranks_simulated.csv")))
+    us = load_cd8scape(require(joinpath(HLAN, "US", "per_allele_best_ranks_simulated.csv")))
+    freq = merge(load_frequencies(joinpath(HLAN, "UK", "supertype_panel_squished.csv");
+                                  on_duplicate=:error),
+                 load_frequencies(joinpath(HLAN, "US", "supertype_panel_validated.csv");
+                                  on_duplicate=:error))
+
+    pa = panel_alignment(uk, us; frequencies=freq, nperm=nperm,
+                         rng=MersenneTwister(SEED), drop_shared=false)
+    @info "  alignment=$(round(pa.alignment, digits=4)) z=$(round(pa.z, digits=2)) p=$(pa.p)"
+    @info "  shared alleles=$(pa.n_shared)  frac_query=$(round(pa.frac_shared_query, digits=3))" 
+
+    # Per-allele scores two ways. leave_one_out=false is the primary figure;
+    # =true is the diagnostic that answers "is this just alleles matching
+    # themselves?" without ever computing a dropped-panel score. If the UK-only
+    # alleles also score highly, the alignment is not an artefact of the overlap.
+    n_in  = analyse(uk, us; frequencies=freq, k=:auto, panel=false, leave_one_out=false)
+    n_out = analyse(uk, us; frequencies=freq, k=:auto, panel=false, leave_one_out=true)
+
+    scores = copy(n_in.scores)
+    rename!(scores, :weighted_nbhd_r => :weighted_nbhd_r_with_self)
+    scores[!, :weighted_nbhd_r_loo] =
+        n_out.scores[indexin(scores.allele, n_out.scores.allele), :weighted_nbhd_r]
+
+    mkpath(RESULTS)
+    f1 = joinpath(RESULTS, "part3_uk_vs_us_per_allele.csv"); CSV.write(f1, scores)
+    f2 = joinpath(RESULTS, "part3_uk_vs_us_alignment.csv")
+    CSV.write(f2, DataFrame(alignment=pa.alignment, z=pa.z, p=pa.p,
+                            null_mean=pa.null_mean, null_sd=pa.null_sd, nperm=pa.nperm,
+                            n_query=pa.n_query, n_reference=pa.n_reference,
+                            n_variants=pa.n_variants, n_shared=pa.n_shared,
+                            frac_shared_query=pa.frac_shared_query,
+                            frac_shared_reference=pa.frac_shared_reference,
+                            k=n_in.k))
+    @info "  → $f1  ($(nrow(scores)) alleles)"
+    @info "  → $f2"
+    (alignment=pa, scores=scores)
+end
+
+# ── Part 4 ───────────────────────────────────────────────────────────────────
+# Pooled-across-segments analysis.
+#
+# Pooling is native: load_cd8scape accepts a list of paths and combines them,
+# and the CD8scape `Frame` column holds the segment name, so variant keys stay
+# globally unique across the eight segments (no collisions).
+#
+# The one thing pooling changes is what centring means. column_center removes
+# each allele's mean across the variant axis; on a pooled matrix that is a
+# single grand mean, so segment-level offsets survive — every allele in both
+# panels sits higher on MP than on NA, and CKA banks that agreement before it
+# looks at any within-segment ordering. That component is largely segment
+# peptide composition, not BoLA.
+#
+# So each allele's profile is centred WITHIN each segment block before the
+# matrices go downstream. Each block then has column mean 0, hence so does the
+# pooled column (the block sums are each zero whatever the block sizes), which
+# makes the library's own column_center a no-op and the implicit centring in
+# correlation_matrix's Pearson r likewise. Nothing in src/ changes.
+#
+# Centring is applied AFTER variant alignment, so the blocks are exactly
+# mean-zero on the matrices actually used. The returned ProfileSets share one
+# key table, so the inner join inside analyse / panel_alignment is a row-for-row
+# pass-through and the centring is preserved.
+#
+# alignment_sensitivity is deliberately NOT run here: it thresholds on zero
+# entries to find zero-inflation, and centring moves the zeros. frac_retained in
+# Part 2 was 1.0 (or 0.9993), so there is no zero-inflation in this dataset to
+# check for anyway.
+
+"""
+    pooled_centred(q, r; frame_col="Frame") -> (ProfileSet, ProfileSet, Vector{String})
+
+Align `q` and `r` on their shared variants, then mean-centre every allele's
+profile within each `frame_col` block. Both returned sets carry the same
+aligned key table; the third return value lists the segments found.
+"""
+function pooled_centred(q::ProfileSet, r::ProfileSet; frame_col::AbstractString="Frame")
+    kc = names(q.keys)
+    names(r.keys) == kc ||
+        error("pooled_centred: key columns differ ($kc vs $(names(r.keys)))")
+    frame_col in kc || error("pooled_centred: no '$frame_col' column in keys ($kc)")
+
+    qk = copy(q.keys); qk.__qrow = 1:nrow(qk)
+    rk = copy(r.keys); rk.__rrow = 1:nrow(rk)
+    j = innerjoin(qk, rk, on=kc)
+    nrow(j) == 0 && error("pooled_centred: query and reference share no variants")
+
+    Mq = q.M[j.__qrow, :]
+    Mr = r.M[j.__rrow, :]
+    keys_aligned = j[:, kc]
+
+    groups = Dict{String,Vector{Int}}()
+    for (i, f) in enumerate(string.(keys_aligned[!, frame_col]))
+        push!(get!(groups, f, Int[]), i)
+    end
+    for M in (Mq, Mr), rows in values(groups)
+        blk = view(M, rows, :)
+        blk .-= mean(blk, dims=1)
+    end
+
+    (ProfileSet(keys_aligned, q.alleles, Mq),
+     ProfileSet(keys_aligned, r.alleles, Mr),
+     sort!(collect(keys(groups))))
+end
+
+function part4()
+    @info "Part 4 — pooled across segments, within-segment centred"
+    f_hla, f_sla, f_bola = load_frequencies.((FREQ_HLA, FREQ_SLA, FREQ_BOLA);
+                                             on_duplicate=:error)
+
+    # Pool the eight per-segment files into one panel per species.
+    @info "  loading pooled panels"
+    pools = Dict(
+        "BoLA" => load_cd8scape([require(seg_path(s))           for s in SEGMENTS]),
+        "HLA"  => load_cd8scape([require(seg_path(s, "_human")) for s in SEGMENTS]),
+        "SLA"  => load_cd8scape([require(seg_path(s, "_swine")) for s in SEGMENTS]),
+    )
+    for (nm, ps) in pools
+        @info "    $nm: $(nvariants(ps)) variants × $(nalleles(ps)) alleles"
+    end
+
+    pairings = [
+        ("BoLA", "HLA", merge(f_bola, f_hla)),
+        ("BoLA", "SLA", merge(f_bola, f_sla)),
+        ("SLA",  "HLA", merge(f_sla,  f_hla)),
+    ]
+
+    # ── pooled panel alignment ────────────────────────────────────────────────
+    rows = DataFrame()
+    for (qn, rn, freq) in pairings
+        q0, r0 = pools[qn], pools[rn]
+        qc, rc, frames = pooled_centred(q0, r0)
+        pa = panel_alignment(qc, rc; frequencies=freq, nperm=NPERM_PANEL,
+                             rng=MersenneTwister(SEED), drop_shared=false)
+        push!(rows, (query=qn, reference=rn, centring="within_segment",
+                     alignment=pa.alignment, z=pa.z, p=pa.p,
+                     null_mean=pa.null_mean, null_sd=pa.null_sd,
+                     n_query=pa.n_query, n_reference=pa.n_reference,
+                     n_variants=pa.n_variants, n_segments=length(frames),
+                     n_shared=pa.n_shared); promote=true)
+        @info "  $qn→$rn pooled: alignment=$(round(pa.alignment, digits=4)) " *
+              "null_mean=$(round(pa.null_mean, digits=5)) p=$(pa.p) " *
+              "n_variants=$(pa.n_variants)"
+    end
+    mkpath(RESULTS)
+    f = joinpath(RESULTS, "part4_pooled_panel_alignment.csv")
+    CSV.write(f, rows); @info "  → $f  ($(nrow(rows)) rows)"
+
+    # ── pooled per-allele scores (single k over all segments) ─────────────────
+    qc, rc, _ = pooled_centred(pools["BoLA"], pools["HLA"])
+    n = analyse(qc, rc; frequencies=f_hla, k=:auto, panel=false)
+    scores = copy(n.scores)
+    scores[!, :k_used] .= n.k
+    f2 = joinpath(RESULTS, "part4_pooled_per_allele_bola_vs_hla.csv")
+    CSV.write(f2, scores)
+    @info "  pooled per-allele: $(nrow(scores)) BoLA alleles, k=$(n.k)"
+    @info "  → $f2"
+
+    (alignment=rows, scores=scores)
+end
+
+# ── Part 5 ───────────────────────────────────────────────────────────────────
+# The reconsidered panel-level test. Supersedes Parts 2 and 4: it answers their
+# question on the whole variant set at once, with a statistic and a scale that
+# mean something.
+#
+# NOT PER SEGMENT. Segments are an influenza accident — the method has to work on
+# any viral sequence, and Part 3's SARS-CoV-2 panels are unsegmented already. So
+# the unit is the whole variant set: the eight per-segment files are pooled into
+# one panel per species (load_cd8scape takes a list of paths) and the comparison
+# is made once per pairing. Nothing about `Frame` is needed, and the
+# between-segment ordering that Part 2 invited — which tracked n_variants at
+# r ~= -0.7 and was never interpretable — simply does not arise.
+#
+# Part 4's within-segment centring is also unnecessary here. A segment offset is
+# a pattern in the variant means, and double centring removes the variant means,
+# so the segment structure goes with them. (`part4()` is kept as the check that
+# the two routes agree.)
+#
+# What Part 2 got wrong, visible in its own output:
+#
+#  (a) p is uninformative. All 24 pairings returned exactly 1/(nperm+1): no
+#      permutation ever approached the observed value. Free row permutation
+#      destroys all variant-level correspondence, so it tests "is there any
+#      correspondence at all", which nobody doubts. Raising nperm only lowers
+#      the floor.
+#  (b) z is actively misleading. corr(z, n_variants) = 0.95 against
+#      corr(z, alignment) = -0.17 — z measures how many variants there are,
+#      because the null's sd shrinks with n. It inverted the real ordering.
+#  (c) The statistic is inflated by a component both panels share for
+#      uninteresting reasons. column_center removes each ALLELE's mean but
+#      leaves each VARIANT's mean, and the panels agree on the variant main
+#      effect ("which variants are escape-prone at all") at r ~= 0.67-0.85 —
+#      the shared peptide chemistry the cows writeup already concedes.
+#
+# So: double centring for the statistic, a ceiling for the scale, bootstrap CIs
+# instead of p.
+#
+# THE CEILING must be matched on WEIGHT PROFILE, not just allele count. BoLA's 18
+# carrier frequencies are fairly even (participation ratio 13.1 of 18) while a
+# random 18-allele HLA subset is dominated by one or two common alleles
+# (PR 5.4 +/- 1.6). A count-matched ceiling carrying the reference's own weights
+# is depressed by that concentration, and the observed value spuriously exceeded
+# it. The ceiling therefore draws both sides from the reference repertoire at the
+# two panels' own sizes AND weight profiles. `ceil_refweights` keeps the naive
+# version to show what it does.
+#
+# It is a SCALE, NOT A BOUND: the observed compares a panel against the full
+# reference while the ceiling splits that reference, so figures can exceed 100%.
+#
+# Panels are subset to their nonzero-weight alleles. That changes no number — a
+# zero-weight column is all-zero after sqrt(w) scaling and contributes nothing to
+# any inner product, verified bit-identical — but it makes the sizes honest: the
+# pairings are BoLA 18 x HLA 175, BoLA 18 x SLA 35 and SLA 35 x HLA 175, not the
+# 127/175/71 PanelAlignment prints.
+
+"""
+    _prepare(M_full, keep, w, mode)
+
+Restrict to the weighted panel (`keep`), remove each allele's baseline across
+variants (what `column_center` does), and for `mode === :double` also remove the
+variant main effect **as this panel sees it**: the frequency-weighted mean across
+the panel's own alleles, Σwᵢ·aᵢ / Σwᵢ.
+
+The panel is the object of analysis, so the nuisance term is estimated from the
+panel, weighted the same way the statistic is. Estimating it instead from all
+catalogue alleles unweighted treats alleles the panel does not contain as
+evidence about it; the two estimates correlate at r ≈ 0.94 and differ by ~3%,
+but only the panel-local one is the quantity this metric is about.
+
+Column means stay zero under both modes, so the `column_center` inside `cka` is
+a no-op and the matrix passes through unchanged.
+"""
+function _prepare(M_full::AbstractMatrix, keep, w, mode::Symbol)
+    A = M_full[:, keep]
+    A = A .- mean(A, dims=1)
+    if mode === :double
+        A = A .- (A * w) ./ sum(w)          # weighted variant main effect
+    end
+    A
+end
+
+"The variant main effect a weighted panel sees: Σwᵢ·aᵢ / Σwᵢ per variant."
+function _vme(M_full::AbstractMatrix, keep, w)
+    A = M_full[:, keep]
+    A = A .- mean(A, dims=1)
+    vec((A * w) ./ sum(w))
+end
+
+"Columns with a positive weight — the alleles that actually contribute."
+function _effective(ps::ProfileSet, freq)
+    w = frequency_vector(ps, freq)
+    keep = findall(>(0), w)
+    if isempty(keep)
+        @warn "part5: no allele of this panel carries a weight; using all alleles unweighted"
+        return collect(1:nalleles(ps)), ones(nalleles(ps))
+    end
+    keep, w[keep]
+end
+
+"Participation ratio (Σw)²/Σw² — the effective number of alleles under weights."
+_pr(w) = (p = filter(>(0), w); isempty(p) ? 0.0 : sum(p)^2 / sum(abs2, p))
+
+"Bootstrap percentile CI, resampling shared variants."
+function _boot_ci(Xq, Xr, wq, wr; nboot::Int, rng, α = 0.05)
+    n = size(Xq, 1)
+    vals = Vector{Float64}(undef, nboot)
+    for b in 1:nboot
+        idx = rand(rng, 1:n, n)
+        vals[b] = cka(Xq[idx, :], Xr[idx, :]; wq = wq, wr = wr)
+    end
+    (lo = quantile(vals, α/2), hi = quantile(vals, 1 - α/2), sd = std(vals))
+end
+
+"""
+    _ceiling(Xr, wr, nA, mode; rng, reps)
+
+Align two disjoint random subsets of one prepared panel, the first of size `nA`.
+`mode` sets how the drawn side is weighted:
+
+- `:uniform` — both sides unweighted. No weighting confound; the primary ceiling.
+- `:own`     — both sides carry the reference's own weights for the alleles
+               drawn. This is the CONFOUNDED version: a small random subset of a
+               registry panel is dominated by one or two common alleles, so the
+               ceiling is depressed. Kept only to show that.
+- a vector   — transplanted onto the drawn side, so its evenness matches the
+               query panel's. The weighted analogue of `:uniform`.
+
+Returns mean and sd over `reps` draws.
+"""
+function _ceiling(Xr::AbstractMatrix, wr, nA::Int, mode; rng, reps::Int)
+    p = size(Xr, 2)
+    nA = clamp(nA, 1, p - 1)
+    vals = Float64[]
+    for _ in 1:reps
+        perm = randperm(rng, p)
+        a, b = perm[1:nA], perm[nA+1:end]
+        if mode === :uniform
+            ua, ub = ones(nA), ones(length(b))
+        elseif mode === :own
+            ua, ub = wr[a], wr[b]
+        else                                   # transplant the query's profile
+            length(mode) == nA || error("_ceiling: transplanted weight vector is " *
+                                        "$(length(mode)) long, need $nA")
+            ua, ub = collect(mode), wr[b]
+        end
+        push!(vals, cka(Xr[:, a], Xr[:, b]; wq = ua, wr = ub))
+    end
+    (mean = mean(vals), sd = std(vals), nA = nA, nB = p - nA)
+end
+
+"Largest alignment reached by `nperm` free row permutations — the floor check."
+function _perm_max(Xq, Xr, wq, wr; nperm::Int, rng)
+    maximum(cka(Xq, Xr[randperm(rng, size(Xr,1)), :]; wq=wq, wr=wr) for _ in 1:nperm)
+end
+
+const NBOOT      = parse(Int, get(ENV, "NABACHD_NBOOT",      "500"))
+# The ceiling is a scale every reported figure divides by, so its own sampling
+# error propagates into all of them. Its sd across draws is large (0.05-0.09),
+# so the default is deliberately high: at 1000 draws the SEM is ~0.002, worth
+# ~0.3 points on a "% of ceiling" figure, against ~1.5 points at 40. Lower it
+# only for a quick look.
+const CEIL_REPS  = parse(Int, get(ENV, "NABACHD_CEIL_REPS",  "1000"))
+const FLOOR_PERM = parse(Int, get(ENV, "NABACHD_FLOOR_PERM", "200"))
+
+function part5()
+    @info "Part 5 — pooled across the whole variant set, double-centred, ceiling-scaled"
+    f_hla, f_sla, f_bola = load_frequencies.((FREQ_HLA, FREQ_SLA, FREQ_BOLA);
+                                             on_duplicate=:error)
+
+    # One panel per species over every variant, not one per segment.
+    @info "  pooling $(length(SEGMENTS)) input file(s) per species"
+    pools = Dict(
+        "BoLA" => load_cd8scape([require(seg_path(s))           for s in SEGMENTS]),
+        "HLA"  => load_cd8scape([require(seg_path(s, "_human")) for s in SEGMENTS]),
+        "SLA"  => load_cd8scape([require(seg_path(s, "_swine")) for s in SEGMENTS]),
+    )
+    for nm in ("BoLA", "HLA", "SLA")
+        @info "    $nm: $(nvariants(pools[nm])) variants × $(nalleles(pools[nm])) catalogue alleles"
+    end
+
+    pairings = [("BoLA", "HLA", merge(f_bola, f_hla)),
+                ("BoLA", "SLA", merge(f_bola, f_sla)),
+                ("SLA",  "HLA", merge(f_sla,  f_hla))]
+
+    rows = DataFrame()
+    vme_rows = DataFrame()
+    for (qn, rn, freq) in pairings
+        q, r = pools[qn], pools[rn]
+        kq, wq = _effective(q, freq)
+        kr, wr = _effective(r, freq)
+        Mq, Mr = align_profiles(q, r)
+        rng() = MersenneTwister(SEED)
+
+        vq, vr = _vme(Mq, kq, wq), _vme(Mr, kr, wr)
+        vme = cor(vq, vr)
+        Sq, Sr = _prepare(Mq, kq, wq, :single), _prepare(Mr, kr, wr, :single)
+        Dq, Dr = _prepare(Mq, kq, wq, :double), _prepare(Mr, kr, wr, :double)
+        nq, nr = size(Dq, 2), size(Dr, 2)
+
+        a_sw = cka(Sq, Sr; wq=wq, wr=wr)
+        a_dw = cka(Dq, Dr; wq=wq, wr=wr)
+        ci   = _boot_ci(Dq, Dr, wq, wr; nboot=NBOOT, rng=rng())
+        c_m  = _ceiling(Dr, wr, nq, wq;   rng=rng(), reps=CEIL_REPS)
+        c_own= _ceiling(Dr, wr, nq, :own; rng=rng(), reps=CEIL_REPS)
+        fl   = _perm_max(Dq, Dr, wq, wr; nperm=FLOOR_PERM, rng=rng())
+
+        push!(rows, (query=qn, reference=rn,
+                     n_variants=size(Mq,1), n_query_eff=nq, n_ref_eff=nr,
+                     pr_query=_pr(wq), pr_ref=_pr(wr),
+                     variant_main_effect_r=vme,
+                     align_single=a_sw,
+                     align_double=a_dw, lo=ci.lo, hi=ci.hi,
+                     ceiling=c_m.mean, ceiling_sd=c_m.sd,
+                     ceiling_reps=CEIL_REPS, ceiling_sem=c_m.sd/sqrt(CEIL_REPS),
+                     ceil_refweights=c_own.mean,
+                     frac_ceiling=a_dw/c_m.mean,
+                     frac_ceiling_lo=ci.lo/c_m.mean,
+                     frac_ceiling_hi=ci.hi/c_m.mean,
+                     perm_max=fl, exceeds_all_perms=a_dw > fl); promote=true)
+
+        # The agreement both panels show on "which variants are escape-prone at
+        # all" — the shared peptide chemistry double centring removes. Thinned
+        # for plotting; the correlation above is computed on all of them.
+        stride = max(1, size(Mq,1) ÷ 4000)
+        append!(vme_rows, DataFrame(query=qn, reference=rn,
+                                    vme_query=vq[1:stride:end],
+                                    vme_reference=vr[1:stride:end]))
+
+        @info "  $qn($nq)→$rn($nr) over $(size(Mq,1)) variants: " *
+              "single=$(round(a_sw,digits=4)) double=$(round(a_dw,digits=4)) " *
+              "[$(round(ci.lo,digits=4)), $(round(ci.hi,digits=4))] " *
+              "ceiling=$(round(c_m.mean,digits=4))±$(round(c_m.sd,digits=3)) " *
+              "→ $(round(100*a_dw/c_m.mean,digits=1))% of ceiling | vme_r=$(round(vme,digits=3))"
+    end
+    mkpath(RESULTS)
+    f = joinpath(RESULTS, "part5_pooled_alignment.csv")
+    CSV.write(f, rows); @info "  → $f  ($(nrow(rows)) rows)"
+    f2 = joinpath(RESULTS, "part5_variant_main_effects.csv")
+    CSV.write(f2, vme_rows); @info "  → $f2  ($(nrow(vme_rows)) rows, thinned)"
+    rows
+end
+
+# ── entry point ──────────────────────────────────────────────────────────────
+function main()
+    which = isempty(ARGS) ? "all" : ARGS[1]
+    which in ("1", "2", "3", "4", "5", "all") ||
+        error("usage: writeup_runs.jl [1|2|3|4|5|all]")
+    which in ("1", "all") && part1()
+    which in ("2", "all") && part2()
+    which in ("3", "all") && part3()
+    which in ("4", "all") && part4()
+    which in ("5", "all") && part5()
+    @info "Done. Results in $RESULTS"
+end
+
+abspath(PROGRAM_FILE) == (@__FILE__) && main()
