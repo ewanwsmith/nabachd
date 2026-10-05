@@ -20,3 +20,10 @@ JuliaLocalPreferences.toml
 
 # OS
 .DS_Store
+
+# Working backups taken before in-place edits — kept on disk, out of history.
+*.prearcsin
+*.prekwargs
+*.predup
+*.preparallel
+*.prepanel

@@ -50,10 +50,11 @@ export ProfileSet, nvariants, nalleles,
        read_allele_list, subset_alleles, align_profiles,
        correlation_matrix, topk_mean, weighted_neighbourhood_r,
        default_k_sequence, calibrate_k, find_k_star, neighbourhood_scores,
-       fisher_z, fisher_zinv,
+       arcsin_t, arcsin_tinv,
        column_center, cka, panel_alignment, PanelAlignment,
        informative_variants, alignment_sensitivity, AlignmentSensitivity,
-       Neighbourhood, analyse
+       Neighbourhood, analyse,
+       EscapeConcordance, escape_concordance, sample_local_genotypes
 
 """
     Neighbourhood
@@ -89,7 +90,7 @@ Base.show(io::IO, n::Neighbourhood) = print(io,
 
 """
     analyse(query::ProfileSet, reference::ProfileSet;
-            frequencies=nothing, k=:auto, fisher=true, k_seq=nothing,
+            frequencies=nothing, k=:auto, transform=:arcsin, k_seq=nothing,
             panel=true, nperm=1000, rng=Random.default_rng(),
             leave_one_out=false, drop_shared=false) -> Neighbourhood
 
@@ -99,7 +100,8 @@ Run the full neighbourhood analysis.
                    unweighted analysis (uniform weights).
 - `k`            — `:auto` to select k* by the crossover criterion, or an integer
                    to fix the neighbourhood size.
-- `fisher`       — Fisher z-average the weighted metric (default `true`).
+- `transform`    — pre-averaging transform for the weighted metric:
+                   `:arcsin` (default, bounded at r = ±1) or `:none`.
 - `k_seq`        — optional explicit k sweep for calibration.
 - `panel`        — also compute the panel-level neighbourhood alignment
                    (frequency-weighted CKA + permutation null); default `true`.
@@ -117,7 +119,7 @@ Run the full neighbourhood analysis.
                    to be active (`panel=true`).
 """
 function analyse(query::ProfileSet, reference::ProfileSet;
-                 frequencies=nothing, k=:auto, fisher::Bool=true, k_seq=nothing,
+                 frequencies=nothing, k=:auto, transform::Symbol=:arcsin, k_seq=nothing,
                  panel::Bool=true, nperm::Int=1000, rng=Random.default_rng(),
                  leave_one_out::Bool=false, drop_shared::Bool=false)
     Mq, Mr = align_profiles(query, reference)
@@ -138,7 +140,7 @@ function analyse(query::ProfileSet, reference::ProfileSet;
 
     freq = frequency_vector(reference, frequencies)
     scores = neighbourhood_scores(R, query.alleles, reference.alleles, freq;
-                                  k=k_used, fisher=fisher, leave_one_out=leave_one_out)
+                                  k=k_used, transform=transform, leave_one_out=leave_one_out)
 
     alignment = if panel
         wq = frequencies === nothing ? nothing : frequency_vector(query, frequencies)

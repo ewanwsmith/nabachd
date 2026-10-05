@@ -13,15 +13,19 @@ Random.seed!(1234)   # determinism for the randomised fixtures below
 @testset "NABACHD" begin
 
     # ─────────────────────────────────────────────────────────────────────────
-    @testset "Fisher transform" begin
-        for r in (-0.99, -0.9, -0.3, 0.0, 0.42, 0.9, 0.99)
-            @test fisher_zinv(fisher_z(r)) ≈ r atol = 1e-8
+    @testset "arcsin transform" begin
+        for r in (-1.0, -0.99, -0.9, -0.3, 0.0, 0.42, 0.9, 0.99, 1.0)
+            @test arcsin_tinv(arcsin_t(r)) ≈ r atol = 1e-8
         end
-        @test isfinite(fisher_z(1.0))       # clamped, no Inf
-        @test isfinite(fisher_z(-1.0))
-        @test fisher_z(0.0) == 0.0
-        @test fisher_z(0.5) > 0             # monotone increasing
-        @test fisher_z(0.5) < fisher_z(0.9)
+        @test arcsin_t(0.0) == 0.0
+        @test arcsin_t(0.5) > 0                       # monotone increasing
+        @test arcsin_t(0.5) < arcsin_t(0.9)
+        # bounded at r = ±1 with no clamping — the reason for preferring it
+        @test arcsin_t(1.0)  ≈ pi  atol = 1e-12
+        @test arcsin_t(-1.0) ≈ -pi atol = 1e-12
+        @test isfinite(arcsin_t(1.0)) && isfinite(arcsin_t(-1.0))
+        # r values beyond ±1 (floating-point noise) are clamped, not NaN
+        @test isfinite(arcsin_t(1.0 + 1e-12))
     end
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -40,18 +44,24 @@ Random.seed!(1234)   # determinism for the randomised fixtures below
         r = [0.9, 0.5, 0.1]
         @test weighted_neighbourhood_r(r, [1.0, 0.0, 0.0], 2) ≈ 0.9 atol = 1e-8
         got = weighted_neighbourhood_r(r, [1.0, 1.0, 1.0], 2)
-        want = fisher_zinv(mean(fisher_z.([0.9, 0.5])))
+        want = arcsin_tinv(mean(arcsin_t.([0.9, 0.5])))
         @test got ≈ want atol = 1e-8
         @test weighted_neighbourhood_r(r, [0.0, 0.0, 0.0], 2) ≈ want atol = 1e-8   # zero weights → uniform
-        @test weighted_neighbourhood_r(r, [1.0, 1.0, 1.0], 2; fisher=false) ≈ 0.7 atol = 1e-8
-        @test weighted_neighbourhood_r(r, [1.0, 1.0, 1.0], 10) ≈ fisher_zinv(mean(fisher_z.(r))) atol = 1e-8  # k clamp
+        @test weighted_neighbourhood_r(r, [1.0, 1.0, 1.0], 2; transform=:none) ≈ 0.7 atol = 1e-8
+        @test weighted_neighbourhood_r(r, [1.0, 1.0, 1.0], 10) ≈ arcsin_tinv(mean(arcsin_t.(r))) atol = 1e-8  # k clamp
         # selects by correlation, not position: unsorted input, weights follow the top-k
         r2 = [0.1, 0.95, 0.4]; w2 = [10.0, 1.0, 10.0]      # top-2 are idx 2 (0.95) and 3 (0.4)
-        exp2 = fisher_zinv((1.0*fisher_z(0.95) + 10.0*fisher_z(0.4)) / 11.0)
+        exp2 = arcsin_tinv((1.0*arcsin_t(0.95) + 10.0*arcsin_t(0.4)) / 11.0)
         @test weighted_neighbourhood_r(r2, w2, 2) ≈ exp2 atol = 1e-8
         # a manual hand-weighted example
-        exp3 = fisher_zinv((0.8*fisher_z(0.9) + 0.2*fisher_z(0.5)) / 1.0)
+        exp3 = arcsin_tinv((0.8*arcsin_t(0.9) + 0.2*arcsin_t(0.5)) / 1.0)
         @test weighted_neighbourhood_r(r, [0.8, 0.2, 0.0], 2) ≈ exp3 atol = 1e-8
+        # r = 1.0 (an allele shared between panels, scored on identical inputs)
+        # must stay finite and must not dominate the average
+        @test weighted_neighbourhood_r([1.0, 1.0], [1.0, 1.0], 2) ≈ 1.0 atol = 1e-8
+        @test isfinite(weighted_neighbourhood_r([1.0, 0.5], [1.0, 1.0], 2))
+        @test weighted_neighbourhood_r([1.0, 0.5], [1.0, 1.0], 2) <
+              weighted_neighbourhood_r([1.0, 1.0], [1.0, 1.0], 2)
     end
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -302,9 +312,9 @@ Random.seed!(1234)   # determinism for the randomised fixtures below
         u1 = analyse(q, r; frequencies=nothing, k=2)
         @test u1.frequencies == ones(3)
 
-        # fixed k respected; fisher flag flows through
+        # fixed k respected; transform flag flows through
         @test analyse(q, r; k=1).k == 1
-        nf = analyse(q, r; k=3, fisher=false)
+        nf = analyse(q, r; k=3, transform=:none)
         @test all(isfinite, nf.scores.weighted_nbhd_r)
 
         # panel alignment attached by default, skippable, and matches cka()
@@ -547,5 +557,292 @@ Random.seed!(1234)   # determinism for the randomised fixtures below
         @test pa_ps_drop.alignment ≈ cka(X_nonshared, Y_nonshared) atol = 1e-8
     end
 
+
+end
+
+@testset "escape_concordance" begin
+
+    # ── Minimal synthetic setup ──────────────────────────────────────────────
+    # 20 variants, 6 reference alleles (2 per locus A/B/C), 2 query alleles
+    rng_setup = MersenneTwister(100)
+    n_vars = 20
+
+    # Reference: 6 alleles with correlated profiles
+    Mr_base = randn(rng_setup, n_vars, 2)
+    ref_profiles = hcat(
+        Mr_base * [1.0 0.2; 0.2 1.0] + 0.1 * randn(rng_setup, n_vars, 2),  # A locus
+        Mr_base * [0.8 0.1; 0.1 0.9] + 0.1 * randn(rng_setup, n_vars, 2),  # B locus
+        Mr_base * [0.9 0.15; 0.15 0.85] + 0.1 * randn(rng_setup, n_vars, 2) # C locus
+    )
+    ref_alleles = ["HLA-A01:01", "HLA-A03:01", "HLA-B07:02", "HLA-B08:01",
+                   "HLA-C07:01", "HLA-C07:02"]
+    keys_df = DataFrame(Frame=fill("F", n_vars), Locus=fill("L", n_vars),
+                        Mutation=string.(1:n_vars))
+
+    reference = ProfileSet(keys_df, ref_alleles, ref_profiles)
+
+    # Query: clone 2 reference alleles (high concordance)
+    query_profiles = ref_profiles[:, [1, 3]]   # A01:01 and B07:02
+    query_alleles  = ["HLA-A01:01", "HLA-B07:02"]
+    query_ps       = ProfileSet(keys_df, query_alleles, query_profiles)
+
+    # Frequencies: uniform within locus
+    freqs = Dict("HLA-A01:01" => 0.3, "HLA-A03:01" => 0.2,
+                 "HLA-B07:02" => 0.25, "HLA-B08:01" => 0.15,
+                 "HLA-C07:01" => 0.1, "HLA-C07:02" => 0.1)
+
+    # ── Basic call succeeds ──────────────────────────────────────────────────
+    ec = escape_concordance(query_ps, reference;
+                            frequencies=freqs, k=2, nperm=200,
+                            rng=MersenneTwister(42))
+
+    @test ec isa EscapeConcordance
+    @test ec.n_genotype  == 2
+    @test ec.n_reference == 6
+    @test ec.n_variants  == n_vars
+    @test ec.k           == 2
+    @test ec.k_source    == :user
+    @test ec.nperm       == 200
+    @test 0.0 <= ec.E <= 1.0
+    @test ec.E_min <= ec.E <= ec.E_max
+    @test 0.0 <= ec.percentile <= 1.0
+    @test 0.0 <= ec.p <= 1.0
+
+    # ── per_allele DataFrame structure ──────────────────────────────────────
+    @test nrow(ec.per_allele) == 2
+    @test "allele" in names(ec.per_allele)
+    @test "weighted_nbhd_r" in names(ec.per_allele)
+
+    # ── E is mean of per-allele weighted_nbhd_r ─────────────────────────────
+    @test ec.E ≈ mean(ec.per_allele.weighted_nbhd_r) atol = 1e-10
+
+    # ── k_source :auto when k=:auto ─────────────────────────────────────────
+    ec_auto = escape_concordance(query_ps, reference;
+                                  frequencies=freqs, nperm=50,
+                                  rng=MersenneTwister(7))
+    @test ec_auto.k_source == :auto
+    @test ec_auto.k >= 1
+
+    # ── Reproducibility under fixed seed ────────────────────────────────────
+    ec_a = escape_concordance(query_ps, reference;
+                               frequencies=freqs, k=2, nperm=100,
+                               rng=MersenneTwister(99))
+    ec_b = escape_concordance(query_ps, reference;
+                               frequencies=freqs, k=2, nperm=100,
+                               rng=MersenneTwister(99))
+    @test ec_a.E         ≈ ec_b.E         atol = 1e-12
+    @test ec_a.z         ≈ ec_b.z         atol = 1e-12
+    @test ec_a.percentile ≈ ec_b.percentile atol = 1e-12
+    @test ec_a.p         ≈ ec_b.p         atol = 1e-12
+
+    # ── Cloned alleles → high concordance relative to random draws ──────────
+    # The query alleles are exact copies of reference alleles, so E should be
+    # high and percentile should be > 0.5 (above a typical random genotype).
+    # We use more permutations for a stable test.
+    ec_high = escape_concordance(query_ps, reference;
+                                  frequencies=freqs, k=2, nperm=500,
+                                  rng=MersenneTwister(1234))
+    @test ec_high.percentile >= 0.4    # should be well above random
+
+    # ── Unweighted (no frequencies) runs without error ───────────────────────
+    ec_unw = escape_concordance(query_ps, reference;
+                                 frequencies=nothing, k=2, nperm=100,
+                                 rng=MersenneTwister(5))
+    @test ec_unw isa EscapeConcordance
+    @test 0.0 <= ec_unw.E <= 1.0
+
+    # ── show method produces meaningful string ───────────────────────────────
+    s = sprint(show, ec)
+    @test occursin("EscapeConcordance", s)
+    @test occursin("E=", s)
+    @test occursin("z=", s)
+    @test occursin("percentile=", s)
+    @test occursin("k=2", s)
+
+end
+
+@testset "sample_local_genotypes" begin
+
+    rng_sg = MersenneTwister(200)
+    n_vars = 10
+    keys_df = DataFrame(Frame=fill("F", n_vars), Locus=fill("L", n_vars),
+                        Mutation=string.(1:n_vars))
+    ref_alleles = ["HLA-A01:01", "HLA-A03:01", "HLA-B07:02", "HLA-B08:01",
+                   "HLA-C07:01", "HLA-C07:02"]
+    ref_profiles = randn(rng_sg, n_vars, 6)
+    reference = ProfileSet(keys_df, ref_alleles, ref_profiles)
+
+    freqs = Dict("HLA-A01:01" => 0.3, "HLA-A03:01" => 0.2,
+                 "HLA-B07:02" => 0.25, "HLA-B08:01" => 0.15,
+                 "HLA-C07:01" => 0.1, "HLA-C07:02" => 0.1)
+
+    genotypes = sample_local_genotypes(reference, freqs;
+                                        n=100, rng=MersenneTwister(42))
+
+    # Returns a vector of length n
+    @test length(genotypes) == 100
+    # Each genotype has 6 alleles (2 per locus A, B, C)
+    @test all(length(g) == 6 for g in genotypes)
+    # All alleles in each genotype are valid reference alleles
+    ref_set = Set(ref_alleles)
+    @test all(all(a in ref_set for a in g) for g in genotypes)
+    # Heterozygosity: within each locus pair, alleles differ (match_zygosity=true)
+    # not guaranteed if only 1 allele has freq>0 per locus, but here 2 per locus exist
+    all_het = true
+    for g in genotypes
+        a1, a2 = g[1], g[2]  # A locus
+        b1, b2 = g[3], g[4]  # B locus
+        c1, c2 = g[5], g[6]  # C locus
+        if a1 == a2 || b1 == b2 || c1 == c2
+            all_het = false; break
+        end
+    end
+    @test all_het
+
+    # Reproducibility
+    g1 = sample_local_genotypes(reference, freqs; n=20, rng=MersenneTwister(77))
+    g2 = sample_local_genotypes(reference, freqs; n=20, rng=MersenneTwister(77))
+    @test g1 == g2
+
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Non-HLA loci, p-value tail, and asymmetric leave-one-out
+# (kwargs added 2026-10-05; see handover open items 4/5/6)
+# ─────────────────────────────────────────────────────────────────────────────
+@testset "escape_concordance kwargs" begin
+
+    nv = 40
+    keys_df = DataFrame(Frame=fill("NP", nv), Locus=fill("L", nv),
+                        Mutation=string.(1:nv))
+    bola = ["BoLA-1:00901", "BoLA-1:01901", "BoLA-2:01201", "BoLA-2:01801",
+            "BoLA-3:00201", "BoLA-3:01701", "BoLA-6:01401", "BoLA-N:03401"]
+    Mr = randn(MersenneTwister(11), nv, length(bola))
+    reference = ProfileSet(keys_df, bola, Mr)
+    freqs = Dict(a => 0.1 + 0.05 * i for (i, a) in enumerate(bola))
+    query = ProfileSet(keys_df, ["BoLA-2:01201", "BoLA-3:00201"],
+                       Mr[:, [3, 5]] .+ 0.3 .* randn(MersenneTwister(12), nv, 2))
+
+    # ── loci: the HLA-only default must not silently yield an empty null ─────
+    @test_throws ErrorException sample_local_genotypes(reference, freqs;
+                                                      n = 5, rng = MersenneTwister(1))
+
+    # loci=:auto infers the panel's own loci (1, 2, 3, 6, N here)
+    g_auto = sample_local_genotypes(reference, freqs; n = 10, loci = :auto,
+                                    rng = MersenneTwister(1))
+    @test length(g_auto) == 10
+    @test all(!isempty, g_auto)
+    ref_set = Set(bola)
+    @test all(all(a in ref_set for a in g) for g in g_auto)
+    # 5 loci; the two singleton loci (6, N) contribute a homozygous pair each
+    @test all(length(g) == 10 for g in g_auto)
+
+    # An explicit locus list is still honoured
+    g_expl = sample_local_genotypes(reference, freqs; n = 5, loci = ["2", "3"],
+                                    rng = MersenneTwister(1))
+    @test all(length(g) == 4 for g in g_expl)
+
+    # ── loci=:auto must agree with the default on an HLA class I panel ───────
+    hla = ["HLA-A01:01", "HLA-A03:01", "HLA-B07:02", "HLA-B08:01",
+           "HLA-C07:01", "HLA-C07:02"]
+    hla_ref = ProfileSet(keys_df, hla, randn(MersenneTwister(5), nv, 6))
+    hf = Dict(a => 0.2 for a in hla)
+    @test sample_local_genotypes(hla_ref, hf; n = 8, rng = MersenneTwister(9)) ==
+          sample_local_genotypes(hla_ref, hf; n = 8, loci = :auto,
+                                 rng = MersenneTwister(9))
+
+    # ── escape_concordance passes loci through ──────────────────────────────
+    ec = escape_concordance(query, reference; frequencies = freqs, k = 3,
+                            nperm = 100, loci = :auto, rng = MersenneTwister(42))
+    @test ec isa EscapeConcordance
+    @test !isnan(ec.null_mean)       # the old HLA-only default gave NaN here
+    @test !isnan(ec.E)
+
+    # ── alternative: tails are consistent with each other ───────────────────
+    mk(alt) = escape_concordance(query, reference; frequencies = freqs, k = 3,
+                                 nperm = 100, loci = :auto, alternative = alt,
+                                 rng = MersenneTwister(42))
+    ec2, ecl, ecg = mk(:two_sided), mk(:less), mk(:greater)
+    # E, z and percentile do not depend on the tail; only p does
+    @test ec2.E ≈ ecl.E ≈ ecg.E
+    @test ec2.z ≈ ecl.z ≈ ecg.z
+    @test ec2.percentile ≈ ecl.percentile
+    @test ec2.p ≈ min(2 * min(ecl.p, ecg.p), 1.0)
+    @test all(0.0 < e.p <= 1.0 for e in (ec2, ecl, ecg))
+    @test_throws ErrorException mk(:nonsense)
+
+    # ── asymmetric leave-one-out ────────────────────────────────────────────
+    sym  = escape_concordance(query, reference; frequencies = freqs, k = 3,
+                              nperm = 100, loci = :auto, rng = MersenneTwister(42))
+    asym = escape_concordance(query, reference; frequencies = freqs, k = 3,
+                              nperm = 100, loci = :auto,
+                              leave_one_out_query = false, rng = MersenneTwister(42))
+    # The null is scored identically; only the patient side changes
+    @test sym.null_mean ≈ asym.null_mean
+    @test sym.null_sd   ≈ asym.null_sd
+    # Both query alleles are in the reference panel, so dropping leave-one-out
+    # lets each match itself at r = 1.0 and E can only rise
+    @test asym.E > sym.E
+    # Defaults are symmetric, i.e. unchanged from before these kwargs existed
+    @test sym.E ≈ escape_concordance(query, reference; frequencies = freqs, k = 3,
+                                     nperm = 100, loci = :auto,
+                                     leave_one_out_query = true,
+                                     leave_one_out_null = true,
+                                     rng = MersenneTwister(42)).E
+
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# load_frequencies duplicate-key handling (added 2026-10-05; handover item 2)
+# ─────────────────────────────────────────────────────────────────────────────
+@testset "load_frequencies duplicates" begin
+
+    dir  = mktempdir()
+    # One row per allele × haplotype: BoLA-2:02501 and BoLA-4:02401 appear twice,
+    # exactly as the pre-rebuild Codner panel did.
+    dup_path = joinpath(dir, "dup_panel.csv")
+    open(dup_path, "w") do io
+        println(io, "Allele,Locus,Frequency")
+        println(io, "BoLA-1:02301,A14,0.2344")
+        println(io, "BoLA-2:02501,A14,0.2344")
+        println(io, "BoLA-4:02401,A14,0.2344")
+        println(io, "BoLA-1:00901,A15,0.3398")
+        println(io, "BoLA-2:02501,A15,0.3398")
+        println(io, "BoLA-4:02401,A15,0.3398")
+    end
+    # One row per allele: no duplicates.
+    clean_path = joinpath(dir, "clean_panel.csv")
+    open(clean_path, "w") do io
+        println(io, "Allele,Locus,Frequency")
+        println(io, "BoLA-1:02301,BoLA-1,0.2500")
+        println(io, "BoLA-2:02501,BoLA-2,0.5417")
+    end
+
+    # ── default :warn keeps the last row and says so ────────────────────────
+    d_warn = @test_logs (:warn,) match_mode=:any load_frequencies(dup_path)
+    @test d_warn["BoLA-2:02501"] ≈ 0.3398      # A15 row, i.e. the last
+    @test d_warn["BoLA-4:02401"] ≈ 0.3398
+    @test d_warn["BoLA-1:02301"] ≈ 0.2344      # unduplicated rows untouched
+    @test length(d_warn) == 4
+
+    # ── the historical numbers are preserved, so nothing silently moved ─────
+    @test d_warn == load_frequencies(dup_path; on_duplicate = :last)
+
+    # ── explicit rules ──────────────────────────────────────────────────────
+    d_sum = load_frequencies(dup_path; on_duplicate = :sum)
+    @test d_sum["BoLA-2:02501"] ≈ 0.2344 + 0.3398
+    d_max = load_frequencies(dup_path; on_duplicate = :max)
+    @test d_max["BoLA-2:02501"] ≈ 0.3398
+    d_first = load_frequencies(dup_path; on_duplicate = :first)
+    @test d_first["BoLA-2:02501"] ≈ 0.2344
+    @test_throws ErrorException load_frequencies(dup_path; on_duplicate = :error)
+    @test_throws ErrorException load_frequencies(dup_path; on_duplicate = :nonsense)
+
+    # ── a clean file is unaffected, warns nothing, and :error is safe ───────
+    d_clean = load_frequencies(clean_path)
+    @test d_clean["BoLA-2:02501"] ≈ 0.5417
+    @test length(d_clean) == 2
+    @test d_clean == load_frequencies(clean_path; on_duplicate = :error)
+    @test d_clean == load_frequencies(clean_path; on_duplicate = :sum)
 
 end

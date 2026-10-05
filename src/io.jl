@@ -143,16 +143,72 @@ load_cd8scape(paths; key_cols=CD8SCAPE_KEY_COLS, allele_col="MHC",
     load_long(paths; key_cols=key_cols, allele_col=allele_col, value_col=value_col)
 
 """
-    load_frequencies(path; allele_col="Allele", freq_col="Frequency")
+    load_frequencies(path; allele_col="Allele", freq_col="Frequency",
+                     on_duplicate=:warn)
 
 Load carrier / population frequencies keyed by allele name. Returns a
 `Dict{String,Float64}` keyed on the canonicalised allele name (see
 `normalise_allele`).
+
+A frequency file may name the same allele on more than one row — a panel listed
+as one row per allele × haplotype does this whenever an allele sits on two
+haplotypes. `on_duplicate` decides what happens then:
+
+- `:warn` (default) — keep the **last** row and warn, naming the alleles. This is
+  the historical behaviour, which used to happen silently and so under-weighted
+  the affected alleles without any sign in the output.
+- `:error` — refuse the file. Prefer this when the panel is supposed to carry one
+  row per allele, so a duplicate means the file is wrong.
+- `:sum` — add the rows. Correct for per-chromosome allele frequencies;
+  **wrong for carrier frequencies**, which are not additive.
+- `:max` — keep the largest.
+- `:first` / `:last` — keep that row, without warning.
+
+None of the combining rules reconstructs a true carrier frequency from
+per-haplotype carrier frequencies: carriage of "A14 or A15" is neither the sum
+nor the max of the two, and the haplotypes are not independent. If that is what
+the file holds, fix the file to one row per allele rather than choosing a rule
+here.
 """
-function load_frequencies(path; allele_col="Allele", freq_col="Frequency")
+function load_frequencies(path; allele_col="Allele", freq_col="Frequency",
+                          on_duplicate::Symbol = :warn)
+    on_duplicate in (:warn, :error, :sum, :max, :first, :last) || error(
+        "load_frequencies: on_duplicate must be one of :warn, :error, :sum, " *
+        ":max, :first, :last (got $on_duplicate)")
+
     df = CSV.read(path, DataFrame)
-    Dict(normalise_allele(a) => Float64(f)
-         for (a, f) in zip(df[!, String(allele_col)], df[!, String(freq_col)]))
+    names_in  = df[!, String(allele_col)]
+    freqs_in  = df[!, String(freq_col)]
+
+    out  = Dict{String, Float64}()
+    dups = String[]
+    for (a, f) in zip(names_in, freqs_in)
+        key = normalise_allele(a)
+        val = Float64(f)
+        if haskey(out, key)
+            key in dups || push!(dups, key)
+            out[key] = on_duplicate === :sum   ? out[key] + val :
+                       on_duplicate === :max   ? max(out[key], val) :
+                       on_duplicate === :first ? out[key] :
+                                                 val      # :last, :warn, :error
+        else
+            out[key] = val
+        end
+    end
+
+    if !isempty(dups)
+        if on_duplicate === :error
+            error("load_frequencies: $(length(dups)) allele(s) appear on more " *
+                  "than one row of $path: $(dups). Pass on_duplicate=:sum, :max, " *
+                  ":first or :last to choose a rule, or give the file one row " *
+                  "per allele.")
+        elseif on_duplicate === :warn
+            @warn "load_frequencies: duplicate allele row(s) — keeping the last " *
+                  "of each, which under-weights an allele whose rows are " *
+                  "per-haplotype carrier frequencies" file=path alleles=dups
+        end
+    end
+    out
 end
 
 """

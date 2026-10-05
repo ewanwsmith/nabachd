@@ -12,11 +12,24 @@
 #                        mean_r  = mean over reference.
 #   3. Neighbourhood size k* selected by the crossover criterion
 #      (see `find_k_star`), or fixed by the user.
-#   4. Frequency-weighted top-k neighbourhood r (Fisher-z averaged) — the
+#   4. Frequency-weighted top-k neighbourhood r (arcsin averaged) — the
 #      primary metric.
 
-fisher_z(r)    = atanh(clamp(r, -0.999999, 0.999999))
-fisher_zinv(z) = tanh(z)
+# Pre-averaging transform.
+#
+# arcsin (2·asin, mapped to [-π, π]) is bounded everywhere INCLUDING at r = ±1,
+# where Fisher's z diverges. That matters whenever query and reference panels
+# share alleles: an allele scored in both panels on identical inputs correlates
+# at exactly 1.0, and Fisher's z could only handle it by clamping (atanh of
+# 0.999999 ≈ 7.25), giving such alleles ~5× the leverage of a genuinely strong
+# r = 0.9. arcsin needs no clamp: 2·asin(1) = π.
+#
+# The "arcsin is outdated" critique (Warton & Hui 2011) concerns arcsin(√p) for
+# proportions, which is a different transform on a different quantity.
+arcsin_t(r)    = 2 * asin(clamp(r, -1.0, 1.0))
+arcsin_tinv(z) = sin(z / 2)
+
+const TRANSFORMS = (:arcsin, :none)
 
 """
     correlation_matrix(Mq, Mr) -> R
@@ -50,25 +63,29 @@ function topk_mean(r::AbstractVector, k::Int)
 end
 
 """
-    weighted_neighbourhood_r(r, freq, k; fisher=true)
+    weighted_neighbourhood_r(r, freq, k; transform=:arcsin)
 
 Frequency-weighted top-k neighbourhood r for one query allele.
 
 `r` is the vector of correlations of that allele against all reference alleles;
 `freq` are the reference-allele weights aligned to `r`. The `k` most-correlated
 reference alleles are selected, their weights renormalised within the
-neighbourhood, and (by default) the correlations are Fisher z-transformed before
+neighbourhood, and (by default) the correlations are arcsin-transformed before
 the weighted mean and back-transformed — reducing the leverage of near-unity
 correlations. If all `k` weights are zero, uniform weights are used.
+
+`transform` is `:arcsin` (default) or `:none` for a plain weighted mean.
 """
-function weighted_neighbourhood_r(r::AbstractVector, freq::AbstractVector, k::Int; fisher::Bool=true)
+function weighted_neighbourhood_r(r::AbstractVector, freq::AbstractVector, k::Int; transform::Symbol=:arcsin)
+    transform in TRANSFORMS ||
+        error("weighted_neighbourhood_r: transform must be :arcsin or :none (got :$transform)")
     k = clamp(k, 1, length(r))
     idx = partialsortperm(r, 1:k, rev=true)
     w = Float64.(freq[idx])
     s = sum(w)
     w = s > 0 ? w ./ s : fill(1.0 / k, k)
     rk = r[idx]
-    fisher ? fisher_zinv(sum(w .* fisher_z.(rk))) : sum(w .* rk)
+    transform === :arcsin ? arcsin_tinv(sum(w .* arcsin_t.(rk))) : sum(w .* rk)
 end
 
 """
@@ -139,7 +156,7 @@ end
 
 """
     neighbourhood_scores(R, query_alleles, reference_alleles, freq; k,
-                         fisher=true, leave_one_out=false) -> DataFrame
+                         transform=:arcsin, leave_one_out=false) -> DataFrame
 
 Compute per-query-allele summary statistics and neighbourhood scores. Returns a
 DataFrame sorted by descending weighted neighbourhood r, with columns:
@@ -147,7 +164,7 @@ DataFrame sorted by descending weighted neighbourhood r, with columns:
 shared, nearest_is_self`.
 
 - `nbhd_r`          — unweighted top-k mean correlation
-- `weighted_nbhd_r` — frequency-weighted, Fisher-z top-k mean (primary metric)
+- `weighted_nbhd_r` — frequency-weighted, arcsin top-k mean (primary metric)
 - `nearest_reference`/`nearest_r` — closest single reference allele and its r
   (always over the full reference, not affected by `leave_one_out`)
 - `shared`          — `true` when the query allele's normalised name appears in
@@ -162,7 +179,7 @@ shared, nearest_is_self`.
 """
 function neighbourhood_scores(R::AbstractMatrix, query_alleles::AbstractVector,
                               reference_alleles::AbstractVector, freq::AbstractVector;
-                              k::Int, fisher::Bool=true, leave_one_out::Bool=false)
+                              k::Int, transform::Symbol=:arcsin, leave_one_out::Bool=false)
     n_q, n_ref = size(R)
     n_q == length(query_alleles) ||
         error("neighbourhood_scores: R rows ($n_q) ≠ query alleles ($(length(query_alleles)))")
@@ -198,7 +215,7 @@ function neighbourhood_scores(R::AbstractMatrix, query_alleles::AbstractVector,
         push!(out, (string(query_alleles[i]), k_eff,
                     maximum(r), mean(r),
                     topk_mean(r_loo, k_eff),
-                    weighted_neighbourhood_r(r_loo, f_loo, k_eff; fisher=fisher),
+                    weighted_neighbourhood_r(r_loo, f_loo, k_eff; transform=transform),
                     string(reference_alleles[jbest]), r[jbest],
                     is_shared, nearest_is_self))
     end
@@ -617,4 +634,360 @@ function alignment_sensitivity(query::ProfileSet, reference::ProfileSet;
                           n_query=nalleles(query), n_reference=nalleles(reference),
                           query_alleles=query.alleles, reference_alleles=reference.alleles,
                           drop_shared=drop_shared)
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Escape concordance — genotype-level neighbourhood metric.
+#
+# For a patient's ≤6-allele HLA genotype (a ProfileSet of profiles), escape
+# concordance quantifies how well the patient's escape landscape agrees with the
+# frequency-weighted local reference panel.
+#
+# Per-allele concordance:   weighted_nbhd_r (Fisher-z top-k, leave_one_out=true)
+# Genotype concordance (E): unweighted mean of per-allele scores
+# k selection:              derived from the reference self-neighbourhood, keeping
+#                           patient and null scores on the same k and avoiding
+#                           instability over the tiny (≤6) query
+# Null calibration:         nperm random frequency-proportional local genotypes
+#                           (locus-structured, heterozygous) scored by the same
+#                           pipeline; z, percentile, and two-sided p reported.
+
+# Internal: weighted single draw from a probability vector (which must sum to 1).
+function _sample_weighted(rng, w::AbstractVector{<:Real})
+    u = rand(rng)
+    s = 0.0
+    for (i, wi) in enumerate(w)
+        s += wi
+        s >= u && return i
+    end
+    return length(w)      # rounding fallback
+end
+
+# Internal: derive k* from the reference panel's own self-neighbourhood.
+# Applies the same crossover criterion as find_k_star to the reference
+# self-correlation matrix with the diagonal masked to -1 (LOO), treating
+# each reference allele as a query against the rest of the panel.
+# k* is the neighbourhood size at which topk_mean transitions from tracking
+# the single-best-allele peak to tracking the panel mean — the crossover point
+# of cor(topk, peak) and cor(topk, mean) as k increases.
+function _k_star_reference(R_ref::AbstractMatrix;
+                            k_seq=default_k_sequence(size(R_ref, 2)))
+    n  = size(R_ref, 1)
+    R  = copy(R_ref)
+    for i in 1:n; R[i, i] = -1.0; end      # mask self-match
+    peak  = vec(maximum(R, dims=2))
+    meanr = vec(mean(R, dims=2))
+    ks    = collect(k_seq)
+    cor_peak = Float64[]; cor_mean = Float64[]
+    for k in ks
+        tk = [topk_mean(view(R, i, :), k) for i in 1:n]
+        push!(cor_peak, cor(tk, peak))
+        push!(cor_mean, cor(tk, meanr))
+    end
+    d  = cor_peak .- cor_mean
+    ci = findfirst(i -> sign(d[i]) != sign(d[i+1]), 1:length(d)-1)
+    if ci === nothing
+        k_star = ks[argmin(abs.(d))]
+        @warn "_k_star_reference: no crossover found; using argmin|Δcor| → k = $k_star"
+    else
+        klo, khi = ks[ci], ks[ci+1]
+        dlo, dhi = d[ci], d[ci+1]
+        k_cross  = klo + (-dlo) / (dhi - dlo) * (khi - klo)
+        k_star   = floor(Int, k_cross)
+    end
+    return k_star
+end
+
+"""
+    sample_local_genotypes(reference::ProfileSet, frequencies::AbstractDict;
+                           n=1000, loci=["A","B","C"],
+                           match_zygosity=true,
+                           rng=Random.default_rng()) -> Vector{Vector{String}}
+
+Draw `n` random genotypes from the local reference panel, sampling each locus
+independently with probability proportional to carrier frequency. Only alleles
+that both have a profile in `reference` AND have frequency > 0 in `frequencies`
+are eligible; frequencies are renormalised within each locus over that eligible set.
+
+With `match_zygosity=true` (default) each locus contributes two *distinct*
+alleles (no homozygotes), matching a fully-heterozygous diploid; the first draw
+is removed before the second is made. When a locus has only one eligible allele,
+or when `match_zygosity=false`, two copies of the same allele are placed.
+
+`loci` names the loci to sample. The default `["A","B","C"]` is the classical
+HLA class I set; pass `:auto` to infer the loci present in `reference` instead,
+which is what any non-HLA panel (BoLA, SLA) needs — their locus tokens are digits
+or letters other than A/B/C, so the default matches nothing and every locus is
+dropped. An explicit vector is still honoured.
+
+Returns a `Vector{Vector{String}}` — each inner vector holds the allele names
+for one sampled genotype (up to 2 × length(loci) names).
+"""
+function sample_local_genotypes(reference::ProfileSet, frequencies::AbstractDict;
+                                 n::Int                  = 1000,
+                                 loci::Union{AbstractVector,Symbol} = ["A", "B", "C"],
+                                 match_zygosity::Bool    = true,
+                                 rng                     = Random.default_rng())
+    norm_ref = normalise_allele.(reference.alleles)
+
+    # Parse the locus token from a normalised class I allele name: the single
+    # character after the species prefix. HLA-A01:01 → "A", BoLA-2:01201 → "2",
+    # BoLA-N:03401 → "N", SLA-1:0101 → "1". For HLA class I this returns exactly
+    # what the previous HLA-only pattern did. Class II names (HLA-DRB1…) carry a
+    # multi-character locus and are not handled.
+    function _locus(name::AbstractString)
+        m = match(r"^[A-Za-z]+-([A-Za-z0-9])", name)
+        m === nothing ? nothing : String(m[1])
+    end
+
+    # `loci=:auto` — take the loci actually present in the reference panel.
+    loci_use = if loci === :auto
+        sort(unique(String[l for l in (_locus(nm) for nm in norm_ref) if l !== nothing]))
+    else
+        string.(loci)
+    end
+    isempty(loci_use) && error("sample_local_genotypes: could not determine any locus " *
+                               "from the reference allele names")
+
+    # Build per-locus eligible allele lists (must be profiled AND have freq > 0).
+    locus_alleles  = Dict{String, Vector{String}}()
+    locus_weights  = Dict{String, Vector{Float64}}()
+    for locus in loci_use
+        als = String[]; wts = Float64[]
+        for (allele, norm) in zip(reference.alleles, norm_ref)
+            _locus(norm) == locus || continue
+            w = get(frequencies, norm, 0.0)
+            w > 0 || continue
+            push!(als, allele); push!(wts, w)
+        end
+        if isempty(als)
+            @warn "sample_local_genotypes: no profiled allele with frequency > 0 for locus $locus; locus omitted from null genotypes"
+            continue
+        end
+        locus_alleles[locus] = als
+        locus_weights[locus] = wts ./ sum(wts)
+    end
+
+    # Every locus dropped means the null genotypes would all be empty, which
+    # silently yields NaN concordance scores downstream. Fail loudly instead.
+    isempty(locus_alleles) && error(
+        "sample_local_genotypes: no profiled allele with frequency > 0 for any of " *
+        "loci $(loci_use). For a non-HLA panel pass loci=:auto or the panel's own " *
+        "locus names; the default [\"A\",\"B\",\"C\"] is HLA class I only.")
+
+    genotypes = Vector{Vector{String}}(undef, n)
+    for i in 1:n
+        g = String[]
+        for locus in loci_use
+            !haskey(locus_alleles, locus) && continue
+            als = locus_alleles[locus]; wts = locus_weights[locus]
+            idx1 = _sample_weighted(rng, wts)
+            push!(g, als[idx1])
+            if match_zygosity && length(als) >= 2
+                w2 = copy(wts); w2[idx1] = 0.0; s = sum(w2)
+                idx2 = s > 0 ? _sample_weighted(rng, w2 ./ s) : idx1
+                push!(g, als[idx2])
+            else
+                push!(g, als[idx1])       # allow homozygote
+            end
+        end
+        genotypes[i] = g
+    end
+    return genotypes
+end
+
+"""
+    EscapeConcordance
+
+Escape concordance of a patient HLA genotype with a local reference panel.
+
+**Per-allele table** (`per_allele::DataFrame`, sorted by concordance descending):
+One row per genotype allele with columns
+`allele, k, peak_r, mean_r, nbhd_r, weighted_nbhd_r, nearest_reference, nearest_r,
+shared, nearest_is_self`. `weighted_nbhd_r` is the per-allele escape concordance —
+frequency-weighted arcsin top-k neighbourhood r (see `weighted_neighbourhood_r`),
+by default with leave-one-out applied so an allele shared with the reference panel
+does not inflate its own score.
+
+**Genotype summary:**
+- `E`      — unweighted mean of per-allele `weighted_nbhd_r` (the primary score)
+- `E_min`, `E_max` — per-allele extremes (surfaces an idiosyncratic allele)
+
+**Null calibration** (from `nperm` random locus-structured frequency-proportional
+genotypes scored by the same pipeline):
+- `z`          — `(E − null_mean) / null_sd`
+- `percentile` — fraction of null genotypes with E ≤ E_patient
+- `p`          — two-sided empirical p (`2 × min(tail, 1−tail)`, +1/+1 smoothed)
+- `null_mean`, `null_sd`, `nperm`
+
+**Dimensions and settings:**
+- `k`, `k_source` — neighbourhood size and derivation (`:auto` = reference-derived,
+                    `:user` = manually supplied)
+- `n_genotype`, `n_reference`, `n_variants` — panel and variant counts
+"""
+struct EscapeConcordance
+    per_allele   ::DataFrame
+    E            ::Float64
+    E_min        ::Float64
+    E_max        ::Float64
+    z            ::Float64
+    percentile   ::Float64
+    p            ::Float64
+    null_mean    ::Float64
+    null_sd      ::Float64
+    nperm        ::Int
+    k            ::Int
+    k_source     ::Symbol
+    n_genotype   ::Int
+    n_reference  ::Int
+    n_variants   ::Int
+end
+
+Base.show(io::IO, ec::EscapeConcordance) = print(io,
+    "EscapeConcordance(E=$(round(ec.E, digits=4)), " *
+    "z=$(round(ec.z, digits=2)), percentile=$(round(100*ec.percentile, digits=1))%, " *
+    "k=$(ec.k) [$(ec.k_source)], " *
+    "$(ec.n_genotype) genotype × $(ec.n_reference) reference alleles, " *
+    "$(ec.n_variants) variants)")
+
+"""
+    escape_concordance(query::ProfileSet, reference::ProfileSet;
+                       frequencies=nothing, k::Union{Int,Symbol}=:auto,
+                       transform=:arcsin, nperm=1000,
+                       loci=["A","B","C"], match_zygosity=true,
+                       leave_one_out_query=true, leave_one_out_null=true,
+                       alternative=:two_sided,
+                       rng=Random.default_rng()) -> EscapeConcordance
+
+Escape concordance of the `query` genotype against the `reference` local panel,
+with null calibration from random locus-structured local genotypes.
+
+`query` is a ProfileSet of the patient's allele profiles (e.g. loaded from the
+patient panel's `per_allele_best_ranks.csv` with `load_cd8scape`). `reference`
+is the local population panel (e.g. the AFND Moscow supertype panel). Both are
+aligned on their shared variants before scoring.
+
+**Arguments:**
+- `frequencies` — `Dict{String,Float64}` from `load_frequencies`, keyed on
+  normalised allele names. Weights the per-allele neighbourhood metric and the
+  null genotype sampler. With `nothing`, scoring is unweighted and the null
+  samples uniformly within each locus over profiled alleles.
+- `k` — neighbourhood size: `:auto` (default) derives k* from the reference
+  panel's own self-neighbourhood structure, keeping patient and null scores on
+  the same footing; pass an `Int` to fix it.
+- `transform` — pre-averaging transform for the weighted neighbourhood r:
+  `:arcsin` (default) or `:none`.
+- `nperm` — number of random local genotypes for the null (default `1000`).
+- `loci`, `match_zygosity` — passed to [`sample_local_genotypes`](@ref) for the
+  null. The `loci` default is HLA class I; a non-HLA reference panel needs
+  `loci=:auto` or an explicit list, or no null genotype can be built.
+- `leave_one_out_query`, `leave_one_out_null` — whether a genotype allele that is
+  also in the reference panel is excluded from its own neighbourhood, for the
+  patient and the null respectively. Both default `true`, which is symmetric.
+  Setting `leave_one_out_query=false` with the null left at `true` gives the
+  asymmetric variant: a shared allele contributes its genuine signal to the
+  patient score, while within-null self-matches (r = 1.0) are still prevented
+  from inflating the null. That asymmetry is untested — it changes what `E`
+  means relative to its null, so compare both before relying on it.
+- `alternative` — tail for `p`: `:two_sided` (default), `:less` for the
+  hypothesis that concordance is unusually *low* (the direction of interest when
+  asking whether a genotype is poorly covered by the local panel), or
+  `:greater`. `z` and `percentile` are unaffected.
+- `rng` — e.g. `MersenneTwister(42)` for reproducibility.
+
+Returns an [`EscapeConcordance`](@ref).
+"""
+function escape_concordance(query::ProfileSet, reference::ProfileSet;
+                            frequencies = nothing,
+                            k::Union{Int, Symbol} = :auto,
+                            transform::Symbol      = :arcsin,
+                            nperm::Int             = 1000,
+                            loci::Union{AbstractVector,Symbol} = ["A", "B", "C"],
+                            match_zygosity::Bool   = true,
+                            leave_one_out_query::Bool = true,
+                            leave_one_out_null::Bool  = true,
+                            alternative::Symbol    = :two_sided,
+                            rng                    = Random.default_rng())
+    alternative in (:two_sided, :less, :greater) || error(
+        "escape_concordance: alternative must be :two_sided, :less or :greater " *
+        "(got $alternative)")
+
+    # ── Align on shared variants ────────────────────────────────────────────
+    Mq, Mr  = align_profiles(query, reference)
+    n_vars  = size(Mq, 1)
+    n_ref   = nalleles(reference)
+
+    freq_vec = frequencies !== nothing ? frequency_vector(reference, frequencies) :
+                                         ones(n_ref)
+
+    # ── Reference self-correlation (computed once; reused for k* and null) ──
+    R_self = cor(Mr, Mr)     # (n_ref × n_ref), diagonal = 1.0
+
+    # ── k selection ─────────────────────────────────────────────────────────
+    k_source = :auto
+    if k === :auto
+        k = _k_star_reference(R_self)
+    else
+        k_source = :user
+    end
+    k_use = Int(k)
+
+    # ── Per-allele concordance for the patient genotype ─────────────────────
+    R      = correlation_matrix(Mq, Mr)
+    scores = neighbourhood_scores(R, query.alleles, reference.alleles, freq_vec;
+                                  k=k_use, transform=transform,
+                                  leave_one_out=leave_one_out_query)
+    wscores = scores.weighted_nbhd_r
+    E     = mean(wscores)
+    E_min = minimum(wscores)
+    E_max = maximum(wscores)
+
+    # ── Null: random locus-structured frequency-proportional genotypes ───────
+    # When no frequencies are supplied, sample uniformly within each locus over
+    # all profiled alleles (assign weight 1.0 to every reference allele).
+    null_freq_dict = if frequencies !== nothing
+        frequencies
+    else
+        Dict(normalise_allele(a) => 1.0 for a in reference.alleles)
+    end
+
+    null_genotypes = sample_local_genotypes(reference, null_freq_dict;
+                                             n=nperm, loci=loci,
+                                             match_zygosity=match_zygosity, rng=rng)
+
+    # Build a lookup: normalised allele name → column index in R_self
+    norm_ref       = normalise_allele.(reference.alleles)
+    ref_name_index = Dict(nm => i for (i, nm) in enumerate(norm_ref))
+
+    null_E = Float64[]
+    sizehint!(null_E, nperm)
+    for null_g in null_genotypes
+        norm_null = normalise_allele.(null_g)
+        idxs = [get(ref_name_index, nm, nothing) for nm in norm_null]
+        any(isnothing, idxs) && continue      # skip unprofiled (should not happen)
+        idxs    = Int.(idxs)
+        R_null  = R_self[idxs, :]             # (n_null_alleles × n_ref)
+        s_null  = neighbourhood_scores(R_null, null_g, reference.alleles, freq_vec;
+                                       k=k_use, transform=transform,
+                                       leave_one_out=leave_one_out_null)
+        push!(null_E, mean(s_null.weighted_nbhd_r))
+    end
+
+    # ── Null calibration ────────────────────────────────────────────────────
+    n_null    = length(null_E)
+    null_mean = n_null > 0 ? mean(null_E) : 0.0
+    null_sd   = n_null > 1 ? std(null_E)  : 1.0
+    z         = null_sd > 0 ? (E - null_mean) / null_sd : 0.0
+    pctile    = n_null > 0 ? count(<=(E), null_E) / n_null : 0.5
+    # Permutation p with +1/+1 smoothing (mirrors panel_alignment).
+    upper     = (count(>=(E), null_E) + 1) / (n_null + 1)   # P(null >= E)
+    lower     = (count(<=(E), null_E) + 1) / (n_null + 1)   # P(null <= E)
+    p = alternative === :two_sided ? min(2 * min(upper, lower), 1.0) :
+        alternative === :less      ? lower :
+                                     upper
+
+    EscapeConcordance(scores, E, E_min, E_max, z, pctile, p,
+                      null_mean, null_sd, nperm,
+                      k_use, k_source,
+                      nalleles(query), n_ref, n_vars)
 end
