@@ -165,6 +165,20 @@ function part2()
 end
 
 # ── Part 3 ───────────────────────────────────────────────────────────────────
+# Part 3's panel-level statistic is the same construction as Part 5 (double
+# centring, weight-matched ceiling, bootstrap CI) rather than the single-centred
+# permutation version, so its value is on the same scale as the species
+# comparisons and can be quoted beside them. The permutation null is not run:
+# with 58,458 variants it returns its floor, exactly as in Part 2.
+#
+# Reps default lower than Part 5's because the matrices are an order of
+# magnitude larger: cost goes as n_variants x n_alleles^2, and the US panel is
+# 2,078 alleles over 58,458 variants. 200 bootstrap resamples and 100 ceiling
+# draws put the ceiling's SEM near 0.006 — around a point on a "% of ceiling"
+# figure, well inside the bootstrap interval.
+const P3_NBOOT = parse(Int, get(ENV, "NABACHD_P3_NBOOT", "200"))
+const P3_CEIL  = parse(Int, get(ENV, "NABACHD_P3_CEIL",  "100"))
+
 function part3(; nperm = NPERM_BIG)
     @info "Part 3 — overlap demonstration: UK vs US registry panels (SARS-CoV-2)"
     uk = load_cd8scape(require(joinpath(HLAN, "UK", "per_allele_best_ranks_simulated.csv")))
@@ -174,15 +188,9 @@ function part3(; nperm = NPERM_BIG)
                  load_frequencies(joinpath(HLAN, "US", "supertype_panel_validated.csv");
                                   on_duplicate=:error))
 
-    pa = panel_alignment(uk, us; frequencies=freq, nperm=nperm,
-                         rng=MersenneTwister(SEED), drop_shared=false)
-    @info "  alignment=$(round(pa.alignment, digits=4)) z=$(round(pa.z, digits=2)) p=$(pa.p)"
-    @info "  shared alleles=$(pa.n_shared)  frac_query=$(round(pa.frac_shared_query, digits=3))" 
-
     # Per-allele scores two ways. leave_one_out=false is the primary figure;
     # =true is the diagnostic that answers "is this just alleles matching
-    # themselves?" without ever computing a dropped-panel score. If the UK-only
-    # alleles also score highly, the alignment is not an artefact of the overlap.
+    # themselves?" at the per-allele level.
     n_in  = analyse(uk, us; frequencies=freq, k=:auto, panel=false, leave_one_out=false)
     n_out = analyse(uk, us; frequencies=freq, k=:auto, panel=false, leave_one_out=true)
 
@@ -191,19 +199,68 @@ function part3(; nperm = NPERM_BIG)
     scores[!, :weighted_nbhd_r_loo] =
         n_out.scores[indexin(scores.allele, n_out.scores.allele), :weighted_nbhd_r]
 
+    # Panel level, twice: once over the panels as they are, once with every
+    # allele the two panels share removed from both sides. The second is the
+    # control the per-allele leave-one-out cannot give — leave-one-out excludes
+    # an allele from its own neighbourhood, which says nothing about whether the
+    # panel-level alignment is carried by the shared block.
+    Mq, Mr = align_profiles(uk, us)
+    nmz(x) = NABACHD.normalise_allele(x)
+    uk_names, us_names = nmz.(uk.alleles), nmz.(us.alleles)
+    shared = intersect(Set(uk_names), Set(us_names))
+    wq_all, wr_all = frequency_vector(uk, freq), frequency_vector(us, freq)
+
+    rows = DataFrame()
+    for (tag, drop) in (("all", false), ("shared_dropped", true))
+        kq = findall(i -> wq_all[i] > 0 && !(drop && uk_names[i] in shared),
+                     1:length(wq_all))
+        kr = findall(i -> wr_all[i] > 0 && !(drop && us_names[i] in shared),
+                     1:length(wr_all))
+        (isempty(kq) || isempty(kr)) &&
+            error("part3: $tag left one side with no weighted allele")
+        wq, wr = wq_all[kq], wr_all[kr]
+        rng() = MersenneTwister(SEED)
+
+        Sq, Sr = _prepare(Mq, kq, wq, :single), _prepare(Mr, kr, wr, :single)
+        Dq, Dr = _prepare(Mq, kq, wq, :double), _prepare(Mr, kr, wr, :double)
+        nq, nr = size(Dq, 2), size(Dr, 2)
+
+        a_sw = cka(Sq, Sr; wq=wq, wr=wr)
+        a_dw = cka(Dq, Dr; wq=wq, wr=wr)
+        ci   = _boot_ci(Dq, Dr, wq, wr; nboot=P3_NBOOT, rng=rng())
+        c_m  = _ceiling(Dr, wr, nq, wq;   rng=rng(), reps=P3_CEIL)
+        c_o  = _ceiling(Dr, wr, nq, :own; rng=rng(), reps=P3_CEIL)
+
+        ns = count(i -> uk_names[i] in shared, kq)
+        push!(rows, (variant=tag, n_variants=size(Mq, 1),
+                     n_query_eff=nq, n_ref_eff=nr,
+                     n_shared=ns,
+                     frac_shared_query=ns / nq,
+                     frac_shared_reference=count(i -> us_names[i] in shared, kr) / nr,
+                     pr_query=_pr(wq), pr_ref=_pr(wr),
+                     align_single=a_sw,
+                     align_double=a_dw, lo=ci.lo, hi=ci.hi,
+                     ceiling=c_m.mean, ceiling_sd=c_m.sd,
+                     ceiling_reps=P3_CEIL, ceiling_sem=c_m.sd / sqrt(P3_CEIL),
+                     ceil_refweights=c_o.mean,
+                     frac_ceiling=a_dw / c_m.mean,
+                     frac_ceiling_lo=ci.lo / c_m.mean,
+                     frac_ceiling_hi=ci.hi / c_m.mean,
+                     k=n_in.k); promote=true)
+
+        @info "  $tag: UK($nq)->US($nr) over $(size(Mq,1)) variants, $ns shared: " *
+              "single=$(round(a_sw,digits=4)) double=$(round(a_dw,digits=4)) " *
+              "[$(round(ci.lo,digits=4)), $(round(ci.hi,digits=4))] " *
+              "ceiling=$(round(c_m.mean,digits=4))±$(round(c_m.sd,digits=3)) " *
+              "→ $(round(100*a_dw/c_m.mean,digits=1))% of ceiling"
+    end
+
     mkpath(RESULTS)
     f1 = joinpath(RESULTS, "part3_uk_vs_us_per_allele.csv"); CSV.write(f1, scores)
-    f2 = joinpath(RESULTS, "part3_uk_vs_us_alignment.csv")
-    CSV.write(f2, DataFrame(alignment=pa.alignment, z=pa.z, p=pa.p,
-                            null_mean=pa.null_mean, null_sd=pa.null_sd, nperm=pa.nperm,
-                            n_query=pa.n_query, n_reference=pa.n_reference,
-                            n_variants=pa.n_variants, n_shared=pa.n_shared,
-                            frac_shared_query=pa.frac_shared_query,
-                            frac_shared_reference=pa.frac_shared_reference,
-                            k=n_in.k))
+    f2 = joinpath(RESULTS, "part3_uk_vs_us_alignment.csv");  CSV.write(f2, rows)
     @info "  → $f1  ($(nrow(scores)) alleles)"
-    @info "  → $f2"
-    (alignment=pa, scores=scores)
+    @info "  → $f2  ($(nrow(rows)) rows)"
+    (alignment=rows, scores=scores)
 end
 
 # ── Part 4 ───────────────────────────────────────────────────────────────────
@@ -459,23 +516,52 @@ Returns mean and sd over `reps` draws.
 """
 function _ceiling(Xr::AbstractMatrix, wr, nA::Int, mode; rng, reps::Int)
     p = size(Xr, 2)
-    nA = clamp(nA, 1, p - 1)
-    vals = Float64[]
-    for _ in 1:reps
+    # Not a clamp. Silently trimming nA would return a ceiling for a split the
+    # caller did not ask for — and with :own or :uniform weights nothing further
+    # would catch it, so the figure would be scaled by the wrong number. The
+    # construction only makes sense when the query panel is the smaller one.
+    1 <= nA < p || error("_ceiling: need 1 <= nA < $p (the reference panel's " *
+                         "size); got nA = $nA. The ceiling splits the reference " *
+                         "into a query-sized part and a remainder, so the query " *
+                         "panel must be smaller than the reference.")
+
+    # The fast path assumes Xr's columns are centred. Both `_prepare` modes leave
+    # them that way — assert it rather than trust it, and fall back if not.
+    scale   = maximum(abs, Xr)
+    centred = scale == 0 || maximum(abs, mean(Xr, dims = 1)) <= 1e-8 * scale
+    C2      = centred ? (Xr' * Xr) .^ 2 : nothing
+    centred || @warn "_ceiling: Xr's columns are not centred; using the slow path"
+
+    vals = Vector{Float64}(undef, reps)
+    for i in 1:reps
         perm = randperm(rng, p)
         a, b = perm[1:nA], perm[nA+1:end]
-        if mode === :uniform
-            ua, ub = ones(nA), ones(length(b))
+        ua, ub = if mode === :uniform
+            ones(nA), ones(length(b))
         elseif mode === :own
-            ua, ub = wr[a], wr[b]
+            wr[a], wr[b]
         else                                   # transplant the query's profile
             length(mode) == nA || error("_ceiling: transplanted weight vector is " *
                                         "$(length(mode)) long, need $nA")
-            ua, ub = collect(mode), wr[b]
+            collect(mode), wr[b]
         end
-        push!(vals, cka(Xr[:, a], Xr[:, b]; wq = ua, wr = ub))
+        vals[i] = centred ? _cka_centred_gram(C2, a, b, ua, ub) :
+                            cka(Xr[:, a], Xr[:, b]; wq = ua, wr = ub)
     end
     (mean = mean(vals), sd = std(vals), nA = nA, nB = p - nA)
+end
+
+# CKA between two column subsets of one already-centred matrix, read off
+# C2 = (Xr'Xr).^2. Mirrors `_weight_columns`: weights are clamped at zero, and an
+# all-zero weight vector falls back to uniform for that side.
+function _cka_centred_gram(C2::AbstractMatrix, a, b, ua, ub)
+    u = clamp.(Float64.(ua), 0.0, Inf); all(iszero, u) && (u = ones(length(ua)))
+    v = clamp.(Float64.(ub), 0.0, Inf); all(iszero, v) && (v = ones(length(ub)))
+    dA  = u' * (@view(C2[a, a]) * u)
+    dB  = v' * (@view(C2[b, b]) * v)
+    num = v' * (@view(C2[b, a]) * u)
+    den = sqrt(dA) * sqrt(dB)
+    den == 0 ? 0.0 : num / den
 end
 
 "Largest alignment reached by `nperm` free row permutations — the floor check."
@@ -562,11 +648,28 @@ function part5()
               "ceiling=$(round(c_m.mean,digits=4))±$(round(c_m.sd,digits=3)) " *
               "→ $(round(100*a_dw/c_m.mean,digits=1))% of ceiling | vme_r=$(round(vme,digits=3))"
     end
+    # Panel composition as actually used: the alleles of each pooled catalogue
+    # that carry a nonzero frequency. The frequency FILES are much larger than
+    # this — supertype_panel.csv lists ~2,080 HLA alleles where 175 are
+    # profiled — so anything describing "the panels" must read this, not the
+    # files.
+    comp = DataFrame()
+    for (nm, fq) in (("BoLA", f_bola), ("HLA", f_hla), ("SLA", f_sla))
+        ps = pools[nm]
+        k, w = _effective(ps, fq)
+        append!(comp, DataFrame(species = nm, allele = ps.alleles[k], weight = w,
+                                n_catalogue = nalleles(ps)); promote = true)
+        @info "    $nm panel: $(length(k)) of $(nalleles(ps)) catalogue alleles " *
+              "carry weight (PR $(round(_pr(w), digits=1)))"
+    end
+
     mkpath(RESULTS)
     f = joinpath(RESULTS, "part5_pooled_alignment.csv")
     CSV.write(f, rows); @info "  → $f  ($(nrow(rows)) rows)"
     f2 = joinpath(RESULTS, "part5_variant_main_effects.csv")
     CSV.write(f2, vme_rows); @info "  → $f2  ($(nrow(vme_rows)) rows, thinned)"
+    f3 = joinpath(RESULTS, "part5_panel_composition.csv")
+    CSV.write(f3, comp); @info "  → $f3  ($(nrow(comp)) rows)"
     rows
 end
 

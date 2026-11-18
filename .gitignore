@@ -27,3 +27,6 @@ JuliaLocalPreferences.toml
 *.predup
 *.preparallel
 *.prepanel
+*.precomp
+*.prep3
+*.preceilgram
