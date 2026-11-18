@@ -183,16 +183,31 @@ function part3(; nperm = NPERM_BIG)
     @info "Part 3 — overlap demonstration: UK vs US registry panels (SARS-CoV-2)"
     uk = load_cd8scape(require(joinpath(HLAN, "UK", "per_allele_best_ranks_simulated.csv")))
     us = load_cd8scape(require(joinpath(HLAN, "US", "per_allele_best_ranks_simulated.csv")))
-    freq = merge(load_frequencies(joinpath(HLAN, "UK", "supertype_panel_squished.csv");
-                                  on_duplicate=:error),
-                 load_frequencies(joinpath(HLAN, "US", "supertype_panel_validated.csv");
-                                  on_duplicate=:error))
+    # ONE DICTIONARY PER PANEL, never merged. These two panels share 406 allele
+    # names, and `merge` lets the second argument win on a duplicate key, so a
+    # merged dictionary weights the UK panel's shared half by US carrier
+    # frequencies: HLA-A01:01 entered at 0.122 instead of 0.667, 308 of the 406
+    # were down-weighted (median factor 0.11), and pr_query read 14.88 where the
+    # UK panel's own frequencies give 11.73. Each panel is weighted by the
+    # registry it came from.
+    #
+    # The species pairings in parts 2/4/5 still merge, which is safe there:
+    # BoLA, HLA and SLA share no allele names, so those merges have no key
+    # collisions. Part 3 is the only overlapping pair.
+    freq_uk = load_frequencies(joinpath(HLAN, "UK", "supertype_panel_squished.csv");
+                               on_duplicate=:error)
+    freq_us = load_frequencies(joinpath(HLAN, "US", "supertype_panel_validated.csv");
+                               on_duplicate=:error)
 
     # Per-allele scores two ways. leave_one_out=false is the primary figure;
     # =true is the diagnostic that answers "is this just alleles matching
     # themselves?" at the per-allele level.
-    n_in  = analyse(uk, us; frequencies=freq, k=:auto, panel=false, leave_one_out=false)
-    n_out = analyse(uk, us; frequencies=freq, k=:auto, panel=false, leave_one_out=true)
+    # `weighted_nbhd_r` weights the REFERENCE side only, so the reference
+    # registry's own file is the right dictionary here. Membership is unchanged:
+    # every US panel allele carrying weight under the old merged dictionary drew
+    # that weight from the US file (n_ref_eff was 2078, the US file's row count).
+    n_in  = analyse(uk, us; frequencies=freq_us, k=:auto, panel=false, leave_one_out=false)
+    n_out = analyse(uk, us; frequencies=freq_us, k=:auto, panel=false, leave_one_out=true)
 
     scores = copy(n_in.scores)
     rename!(scores, :weighted_nbhd_r => :weighted_nbhd_r_with_self)
@@ -208,7 +223,7 @@ function part3(; nperm = NPERM_BIG)
     nmz(x) = NABACHD.normalise_allele(x)
     uk_names, us_names = nmz.(uk.alleles), nmz.(us.alleles)
     shared = intersect(Set(uk_names), Set(us_names))
-    wq_all, wr_all = frequency_vector(uk, freq), frequency_vector(us, freq)
+    wq_all, wr_all = frequency_vector(uk, freq_uk), frequency_vector(us, freq_us)
 
     rows = DataFrame()
     for (tag, drop) in (("all", false), ("shared_dropped", true))

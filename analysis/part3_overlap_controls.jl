@@ -53,10 +53,12 @@ function _load_p3()
     @info "loading UK/US registry panels (SARS-CoV-2)"
     uk = load_cd8scape(require(joinpath(HLAN, "UK", "per_allele_best_ranks_simulated.csv")))
     us = load_cd8scape(require(joinpath(HLAN, "US", "per_allele_best_ranks_simulated.csv")))
-    freq = merge(load_frequencies(joinpath(HLAN, "UK", "supertype_panel_squished.csv");
-                                  on_duplicate = :error),
-                 load_frequencies(joinpath(HLAN, "US", "supertype_panel_validated.csv");
-                                  on_duplicate = :error))
+    # One dictionary per panel, never merged — see the note in part3(). A merged
+    # dictionary weights the UK panel's 406 shared alleles by US frequencies.
+    freq_uk = load_frequencies(joinpath(HLAN, "UK", "supertype_panel_squished.csv");
+                               on_duplicate = :error)
+    freq_us = load_frequencies(joinpath(HLAN, "US", "supertype_panel_validated.csv");
+                               on_duplicate = :error)
     Mq, Mr = align_profiles(uk, us)
     nmz(x) = NABACHD.normalise_allele(x)
     uk_names, us_names = nmz.(uk.alleles), nmz.(us.alleles)
@@ -64,7 +66,7 @@ function _load_p3()
     @info "  UK $(nalleles(uk)) × US $(nalleles(us)) catalogue alleles, " *
           "$(size(Mq, 1)) shared variants, $(length(shared)) shared alleles"
     (Mq = Mq, Mr = Mr, uk_names = uk_names, us_names = us_names, shared = shared,
-     wq_all = frequency_vector(uk, freq), wr_all = frequency_vector(us, freq))
+     wq_all = frequency_vector(uk, freq_uk), wr_all = frequency_vector(us, freq_us))
 end
 
 # Effective dimensionality of a panel: the participation ratio of its weighted
