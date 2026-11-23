@@ -557,6 +557,133 @@ Random.seed!(1234)   # determinism for the randomised fixtures below
         @test pa_ps_drop.alignment ≈ cka(X_nonshared, Y_nonshared) atol = 1e-8
     end
 
+    # ─────────────────────────────────────────────────────────────────────────
+    @testset "escape_concordance: per-allele null" begin
+        rng = MersenneTwister(4242)
+        m   = 250
+        ref_names = ["HLA-A01:01","HLA-A02:01","HLA-A03:01","HLA-A11:01",
+                     "HLA-B07:02","HLA-B08:01","HLA-B15:01","HLA-B27:05",
+                     "HLA-C07:01","HLA-C07:02","HLA-C04:01","HLA-C06:02"]
+        q_names   = ["HLA-A01:01", "HLA-B07:02", "HLA-C07:01"]
+        Mr = randn(rng, m, length(ref_names))
+        Mq = hcat([Mr[:, findfirst(==(a), ref_names)] .+ 0.3 .* randn(rng, m)
+                   for a in q_names]...)
+        keys_df = DataFrame(V = string.(1:m))
+        reference = ProfileSet(keys_df, ref_names, Mr)
+        query     = ProfileSet(keys_df, q_names,   Mq)
+        freqs     = Dict(NABACHD.normalise_allele(a) => 0.1 for a in ref_names)
+
+        ec = escape_concordance(query, reference; frequencies=freqs, k=3,
+                                nperm=100, rng=MersenneTwister(9))
+        pa = ec.per_allele
+
+        # ── columns exist and are populated ──────────────────────────────────
+        for col in ("null_locus", "n_null_allele", "null_mean_allele",
+                    "null_sd_allele", "z_allele", "percentile_allele", "p_allele")
+            @test col in names(pa)
+        end
+        # ── each query allele is calibrated against its OWN locus ────────────
+        for row in eachrow(pa)
+            @test row.null_locus == NABACHD._allele_locus(
+                      NABACHD.normalise_allele(row.allele))
+            @test row.n_null_allele > 0
+            @test 0.0 <= row.percentile_allele <= 1.0
+            @test 0.0 <= row.p_allele <= 1.0
+            @test isfinite(row.z_allele)
+        end
+        # three loci present, so three distinct buckets
+        @test Set(skipmissing(pa.null_locus)) == Set(["A", "B", "C"])
+
+        # ── the null bucket sizes are consistent with the draw ───────────────
+        # match_zygosity draws 2 alleles per locus per null genotype, and 100
+        # genotypes were drawn, so each locus bucket holds 200 scores.
+        @test all(pa.n_null_allele .== 200)
+
+        # ── z_allele agrees with its own definition ──────────────────────────
+        for row in eachrow(pa)
+            recomputed = (row.weighted_nbhd_r - row.null_mean_allele) /
+                         row.null_sd_allele
+            @test row.z_allele ≈ recomputed atol = 1e-10
+        end
+
+        # ── alternative flows through to p_allele ────────────────────────────
+        ec_l = escape_concordance(query, reference; frequencies=freqs, k=3,
+                                  nperm=100, alternative=:less,
+                                  rng=MersenneTwister(9))
+        ec_g = escape_concordance(query, reference; frequencies=freqs, k=3,
+                                  nperm=100, alternative=:greater,
+                                  rng=MersenneTwister(9))
+        # same draws, so the one-sided p's must be complementary in rank order
+        @test all(ec_l.per_allele.p_allele .+ ec_g.per_allele.p_allele .>= 1.0 .- 1e-9)
+        # the genotype-level statistic is untouched by the addition
+        @test ec_l.E ≈ ec.E atol = 1e-12
+        @test ec_g.E ≈ ec.E atol = 1e-12
+
+        # ── locus parser is shared with the null sampler ─────────────────────
+        @test NABACHD._allele_locus("HLA-A01:01") == "A"
+        @test NABACHD._allele_locus("BoLA-N:03401") == "N"
+        @test NABACHD._allele_locus("SLA-1:0101") == "1"
+        @test NABACHD._allele_locus("nonsense") === nothing
+    end
+
+    @testset "panel_alignment: effective panel sizes" begin
+        rng = MersenneTwister(991)
+        m, nq, nr = 200, 5, 7
+        X = randn(rng, m, nq)
+        Y = randn(rng, m, nr)
+
+        # ── unweighted: effective sizes are the column counts, PR likewise ────
+        pa_u = panel_alignment(X, Y; nperm=20, rng=MersenneTwister(1))
+        @test pa_u.n_query_effective == nq
+        @test pa_u.n_reference_effective == nr
+        @test pa_u.pr_query ≈ Float64(nq) atol = 1e-12
+        @test pa_u.pr_reference ≈ Float64(nr) atol = 1e-12
+        # catalogue sizes agree here, so show stays as it was
+        @test !occursin("effective", sprint(show, pa_u))
+
+        # ── zero-weight alleles drop out of the effective count ───────────────
+        # Two query alleles carry no weight; their columns are all-zero after
+        # √w scaling and enter no inner product, so the statistic sees 3.
+        wq = [1.0, 1.0, 1.0, 0.0, 0.0]
+        wr = fill(0.5, nr)
+        pa_w = panel_alignment(X, Y; wq=wq, wr=wr, nperm=20,
+                               rng=MersenneTwister(2), weighted=true)
+        @test pa_w.n_query_effective == 3
+        @test pa_w.n_reference_effective == nr
+        # n_query still reports the catalogue size it was given
+        @test pa_w.n_query == nq
+        @test occursin("effective", sprint(show, pa_w))
+        # and the alignment really is the one on the three weighted columns
+        @test pa_w.alignment ≈ cka(X[:, 1:3], Y; wq=wq[1:3], wr=wr) atol = 1e-10
+
+        # ── participation ratio tracks weight concentration ───────────────────
+        # Even weights → PR is the count; one dominant allele → PR near 1.
+        pa_even = panel_alignment(X, Y; wq=fill(2.0, nq), wr=wr, nperm=20,
+                                  rng=MersenneTwister(3), weighted=true)
+        @test pa_even.pr_query ≈ Float64(nq) atol = 1e-10
+        pa_conc = panel_alignment(X, Y; wq=[1.0, 1e-6, 1e-6, 1e-6, 1e-6], wr=wr,
+                                  nperm=20, rng=MersenneTwister(4), weighted=true)
+        @test pa_conc.n_query_effective == nq      # all carry *some* weight
+        @test pa_conc.pr_query < 1.001             # but one carries nearly all
+        @test pa_conc.pr_query <= pa_conc.n_query_effective
+
+        # ── all-zero weights: mirrors the uniform fallback in _weight_columns ─
+        pa_zero = @test_logs (:warn, r"all weights are zero") match_mode=:any panel_alignment(
+            X, Y; wq=zeros(nq), wr=wr, nperm=20, rng=MersenneTwister(5), weighted=true)
+        @test pa_zero.n_query_effective == nq
+        @test pa_zero.pr_query ≈ Float64(nq) atol = 1e-12
+
+        # ── effective sizes are taken AFTER drop_shared ───────────────────────
+        qa = ["A1", "A2", "SHARED1", "SHARED2", "A3"]
+        ra = ["SHARED1", "SHARED2", "B1", "B2", "B3", "B4", "B5"]
+        pa_drop = panel_alignment(X, Y; nperm=20, rng=MersenneTwister(6),
+                                  query_alleles=qa, reference_alleles=ra,
+                                  n_query=nq, n_reference=nr, drop_shared=true)
+        @test pa_drop.n_query_effective == 3       # 5 less the 2 shared
+        @test pa_drop.n_reference_effective == 5   # 7 less the 2 shared
+        @test pa_drop.n_query == nq                # catalogue size unchanged
+    end
+
 
 end
 

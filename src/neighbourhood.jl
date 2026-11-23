@@ -316,6 +316,24 @@ end
 # Shared-allele statistics are **always reported** (they cost nothing to compute)
 # so the user can judge whether to apply the flags.
 
+# Internal: what the statistic actually sees on one side — the number of alleles
+# carrying a positive weight, and the participation ratio (Σw)²/Σw², which is
+# the effective number of alleles once concentration in the weights is taken
+# into account. Both are computed from the SAME vector that _weight_columns
+# scales by, after any drop_shared, so they describe the matrix that went into
+# the CKA rather than the catalogue it was drawn from.
+#
+# Mirrors the all-zero fallback in _weight_columns: if no allele carries weight
+# that panel enters unweighted, so every column contributes and both figures are
+# the column count.
+function _effective_size(X::AbstractMatrix, w)
+    n = size(X, 2)
+    w === nothing && return (n, Float64(n))
+    pos = filter(>(0), Float64.(w))
+    isempty(pos) && return (n, Float64(n))
+    (length(pos), sum(pos)^2 / sum(abs2, pos))
+end
+
 # Internal: compute shared-allele overlap statistics from allele-name vectors and
 # (optionally) weight vectors. n_query / n_reference are the ORIGINAL panel sizes
 # (used as denominators); if weights are provided they should be aligned to the
@@ -364,8 +382,22 @@ query and reference panel with its permutation-null significance.
 
 **Panel metadata:**
 - `weighted`       — whether carrier frequencies were applied
-- `n_query`, `n_reference`, `n_variants` — the aligned panel dimensions
+- `n_query`, `n_reference`, `n_variants` — the aligned panel dimensions. The
+                     allele counts are the CATALOGUE sizes, which is what the
+                     shared fractions below are taken against; they are not what
+                     the statistic saw whenever a frequency file covers only part
+                     of a catalogue.
 - `drop_shared`    — whether shared alleles were excluded before computing
+
+**Effective panel sizes** — what the statistic actually saw, after any
+`drop_shared` and after zero-weight alleles drop out. A zero-weight column is
+all-zero once scaled by √w and contributes to no inner product, so these are the
+sizes to quote. For an unweighted alignment they equal the column counts.
+- `n_query_effective`, `n_reference_effective` — alleles carrying positive weight
+- `pr_query`, `pr_reference`  — participation ratio (Σw)²/Σw², the effective
+                                number of alleles once weight concentration is
+                                accounted for; ≤ the counts above, and far below
+                                them when one allele carries most of the weight
 
 **Shared-allele diagnostics** (always populated; 0 / 0.0 when names unavailable):
 - `n_shared`                    — alleles with the same normalised name in both panels
@@ -391,13 +423,20 @@ struct PanelAlignment
     frac_shared_reference::Float64
     frac_shared_query_weighted::Float64
     frac_shared_reference_weighted::Float64
+    n_query_effective::Int
+    n_reference_effective::Int
+    pr_query::Float64
+    pr_reference::Float64
 end
 
 Base.show(io::IO, pa::PanelAlignment) = print(io,
     "PanelAlignment(alignment=$(round(pa.alignment, digits=4)), " *
     "z=$(round(pa.z, digits=2)), p=$(pa.p), " *
     "$(pa.weighted ? "frequency-weighted" : "unweighted"), " *
-    "$(pa.n_query)×$(pa.n_reference) alleles, $(pa.n_variants) variants" *
+    "$(pa.n_query)×$(pa.n_reference) alleles" *
+    ((pa.n_query_effective != pa.n_query || pa.n_reference_effective != pa.n_reference) ?
+        " ($(pa.n_query_effective)×$(pa.n_reference_effective) effective)" : "") *
+    ", $(pa.n_variants) variants" *
     (pa.n_shared > 0 ?
         ", $(pa.n_shared) shared ($(round(100*pa.frac_shared_query, digits=1))% Q / $(round(100*pa.frac_shared_reference, digits=1))% R)" :
         "") *
@@ -470,10 +509,14 @@ function panel_alignment(Mq::AbstractMatrix, Mr::AbstractMatrix;
     μ = mean(null); σ = std(null)
     z = σ > 0 ? (obs - μ) / σ : 0.0
 
+    nq_eff, prq = _effective_size(Mq_use, wq_use)
+    nr_eff, prr = _effective_size(Mr_use, wr_use)
+
     PanelAlignment(obs, p, z, μ, σ, nperm, weighted, n_query, n_reference, m,
                    drop_shared, si.n_shared, si.frac_shared_query,
                    si.frac_shared_reference, si.frac_shared_query_weighted,
-                   si.frac_shared_reference_weighted)
+                   si.frac_shared_reference_weighted,
+                   nq_eff, nr_eff, prq, prr)
 end
 
 """
@@ -698,6 +741,19 @@ function _k_star_reference(R_ref::AbstractMatrix;
     return k_star
 end
 
+# Parse the locus token from a normalised class I allele name: the single
+# character after the species prefix. HLA-A01:01 → "A", BoLA-2:01201 → "2",
+# BoLA-N:03401 → "N", SLA-1:0101 → "1". For HLA class I this returns exactly
+# what the previous HLA-only pattern did. Class II names (HLA-DRB1…) carry a
+# multi-character locus and are not handled.
+#
+# Module-level so the null sampler and the per-allele null calibration in
+# escape_concordance agree on what a locus is.
+function _allele_locus(name::AbstractString)
+    m = match(r"^[A-Za-z]+-([A-Za-z0-9])", name)
+    m === nothing ? nothing : String(m[1])
+end
+
 """
     sample_local_genotypes(reference::ProfileSet, frequencies::AbstractDict;
                            n=1000, loci=["A","B","C"],
@@ -730,15 +786,7 @@ function sample_local_genotypes(reference::ProfileSet, frequencies::AbstractDict
                                  rng                     = Random.default_rng())
     norm_ref = normalise_allele.(reference.alleles)
 
-    # Parse the locus token from a normalised class I allele name: the single
-    # character after the species prefix. HLA-A01:01 → "A", BoLA-2:01201 → "2",
-    # BoLA-N:03401 → "N", SLA-1:0101 → "1". For HLA class I this returns exactly
-    # what the previous HLA-only pattern did. Class II names (HLA-DRB1…) carry a
-    # multi-character locus and are not handled.
-    function _locus(name::AbstractString)
-        m = match(r"^[A-Za-z]+-([A-Za-z0-9])", name)
-        m === nothing ? nothing : String(m[1])
-    end
+    _locus = _allele_locus
 
     # `loci=:auto` — take the loci actually present in the reference panel.
     loci_use = if loci === :auto
@@ -875,6 +923,16 @@ aligned on their shared variants before scoring.
 - `k` — neighbourhood size: `:auto` (default) derives k* from the reference
   panel's own self-neighbourhood structure, keeping patient and null scores on
   the same footing; pass an `Int` to fix it.
+The returned `per_allele` DataFrame also carries a **per-allele null
+calibration**, against null alleles of the *same locus*: `null_locus`,
+`n_null_allele`, `null_mean_allele`, `null_sd_allele`, `z_allele`,
+`percentile_allele`, `p_allele`. These answer for one allele what `z` /
+`percentile` / `p` answer for the whole genotype — is this allele's concordance
+unusual among local alleles of its locus? Buckets are per locus because panel
+structure differs between loci, so pooling would calibrate an allele against the
+wrong population. The columns are `NaN` with `n_null_allele = 0` where a locus
+drew no null alleles, and `p_allele` follows `alternative` as the genotype p does.
+
 - `transform` — pre-averaging transform for the weighted neighbourhood r:
   `:arcsin` (default) or `:none`.
 - `nperm` — number of random local genotypes for the null (default `1000`).
@@ -961,6 +1019,13 @@ function escape_concordance(query::ProfileSet, reference::ProfileSet;
 
     null_E = Float64[]
     sizehint!(null_E, nperm)
+    # Per-allele null, bucketed by locus. Every null genotype already produces a
+    # per-allele score vector that was previously discarded at the mean; keeping
+    # it costs nothing and is what lets an individual allele be calibrated.
+    # Buckets are per locus because the panel's structure differs between loci —
+    # a B allele has a denser, more diverse neighbourhood than a C allele — so
+    # pooling across loci would compare an allele against the wrong population.
+    null_by_locus = Dict{String, Vector{Float64}}()
     for null_g in null_genotypes
         norm_null = normalise_allele.(null_g)
         idxs = [get(ref_name_index, nm, nothing) for nm in norm_null]
@@ -971,6 +1036,11 @@ function escape_concordance(query::ProfileSet, reference::ProfileSet;
                                        k=k_use, transform=transform,
                                        leave_one_out=leave_one_out_null)
         push!(null_E, mean(s_null.weighted_nbhd_r))
+        for (nm, sc) in zip(norm_null, s_null.weighted_nbhd_r)
+            loc = _allele_locus(nm)
+            loc === nothing && continue
+            push!(get!(null_by_locus, loc, Float64[]), sc)
+        end
     end
 
     # ── Null calibration ────────────────────────────────────────────────────
@@ -985,6 +1055,40 @@ function escape_concordance(query::ProfileSet, reference::ProfileSet;
     p = alternative === :two_sided ? min(2 * min(upper, lower), 1.0) :
         alternative === :less      ? lower :
                                      upper
+
+    # ── Per-allele calibration against the same-locus null ──────────────────
+    # Answers, for a single allele, what the genotype-level z/percentile/p
+    # answer for the whole genotype: is THIS allele's concordance unusual among
+    # local alleles of its own locus? Columns are NaN (n_null_allele = 0) for an
+    # allele whose locus drew no null alleles.
+    _alloc = (n) -> fill(NaN, n)
+    nq_rows          = nrow(scores)
+    scores.null_locus       = Vector{Union{Missing,String}}(missing, nq_rows)
+    scores.n_null_allele    = zeros(Int, nq_rows)
+    scores.null_mean_allele = _alloc(nq_rows)
+    scores.null_sd_allele   = _alloc(nq_rows)
+    scores.z_allele         = _alloc(nq_rows)
+    scores.percentile_allele= _alloc(nq_rows)
+    scores.p_allele         = _alloc(nq_rows)
+    for i in 1:nq_rows
+        loc = _allele_locus(normalise_allele(scores.allele[i]))
+        loc === nothing && continue
+        dist = get(null_by_locus, loc, Float64[])
+        scores.null_locus[i]    = loc
+        scores.n_null_allele[i] = length(dist)
+        isempty(dist) && continue
+        v  = scores.weighted_nbhd_r[i]
+        mu = mean(dist)
+        sd = length(dist) > 1 ? std(dist) : 0.0
+        up = (count(>=(v), dist) + 1) / (length(dist) + 1)
+        lo = (count(<=(v), dist) + 1) / (length(dist) + 1)
+        scores.null_mean_allele[i]  = mu
+        scores.null_sd_allele[i]    = sd
+        scores.z_allele[i]          = sd > 0 ? (v - mu) / sd : 0.0
+        scores.percentile_allele[i] = count(<=(v), dist) / length(dist)
+        scores.p_allele[i]          = alternative === :two_sided ? min(2*min(up, lo), 1.0) :
+                                      alternative === :less      ? lo : up
+    end
 
     EscapeConcordance(scores, E, E_min, E_max, z, pctile, p,
                       null_mean, null_sd, nperm,

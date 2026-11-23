@@ -152,6 +152,9 @@ function part2()
                      alignment=pa.alignment, z=pa.z, p=pa.p,
                      null_mean=pa.null_mean, null_sd=pa.null_sd,
                      n_query=pa.n_query, n_reference=pa.n_reference,
+                     n_query_eff=pa.n_query_effective,
+                     n_ref_eff=pa.n_reference_effective,
+                     pr_query=pa.pr_query, pr_ref=pa.pr_reference,
                      n_variants=pa.n_variants, n_shared=pa.n_shared,
                      sens_delta=sens.delta, frac_retained=sens.frac_retained);
               promote=true)
@@ -377,6 +380,9 @@ function part4()
                      alignment=pa.alignment, z=pa.z, p=pa.p,
                      null_mean=pa.null_mean, null_sd=pa.null_sd,
                      n_query=pa.n_query, n_reference=pa.n_reference,
+                     n_query_eff=pa.n_query_effective,
+                     n_ref_eff=pa.n_reference_effective,
+                     pr_query=pa.pr_query, pr_ref=pa.pr_reference,
                      n_variants=pa.n_variants, n_segments=length(frames),
                      n_shared=pa.n_shared); promote=true)
         @info "  $qn→$rn pooled: alignment=$(round(pa.alignment, digits=4)) " *
