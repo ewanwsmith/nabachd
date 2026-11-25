@@ -1,12 +1,8 @@
 name = "NABACHD"
 uuid = "2f4be160-e832-4691-8b8c-2d630f836d61"
-authors = ["Ewan Smith <ewanwsmith@googlemail.com>"]
 version = "0.1.0"
+authors = ["Ewan Smith <ewanwsmith@googlemail.com>"]
 
-# The core module loads only these. `src/plots.jl` is a standalone module
-# (NeighbourhoodPlots) that is not included by NABACHD.jl, so its dependencies
-# are declared as weak: they are not installed with the package. To build
-# figures, add them yourself and `include("src/plots.jl")`.
 [deps]
 CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
 DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"

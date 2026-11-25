@@ -598,6 +598,34 @@ Random.seed!(1234)   # determinism for the randomised fixtures below
         proj = read(joinpath(@__DIR__, "..", "Project.toml"), String)
         @test occursin("NABACHDPlotsExt", proj)
         @test isfile(joinpath(@__DIR__, "..", "ext", "NABACHDPlotsExt.jl"))
+
+        # The five triggers must stay weak. `Pkg.add`ing them while this
+        # project is active moves them into [deps], which makes them hard
+        # dependencies of everyone who installs NABACHD and stops them
+        # functioning as extension triggers. Install them into the default
+        # environment instead; they remain loadable with any project active.
+        function _toml_table(src, name)
+            lines  = split(src, '\n')
+            i      = findfirst(==("[$name]"), lines)
+            i === nothing && return String[]
+            out = String[]
+            for l in lines[(i + 1):end]
+                startswith(l, "[") && break
+                isempty(strip(l)) && continue
+                push!(out, String(first(split(l, " = "))))
+            end
+            out
+        end
+        hard = _toml_table(proj, "deps")
+        weak = _toml_table(proj, "weakdeps")
+        for d in ("CairoMakie", "ColorSchemes", "KernelDensity",
+                  "MultivariateStats", "UMAP")
+            @test d in weak
+            @test !(d in hard)
+        end
+        # The trigger list and [weakdeps] must agree, or Julia never primes it.
+        @test Set(weak) == Set(["CairoMakie", "ColorSchemes", "KernelDensity",
+                                "MultivariateStats", "UMAP"])
     end
 
     @testset "escape_concordance: per-allele null" begin

@@ -55,14 +55,30 @@ The core module depends only on `CSV`, `DataFrames`, `LinearAlgebra`, `Random`
 and `Statistics`, so a normal install is light. Figures live in a **package
 extension** (`ext/NABACHDPlotsExt.jl`) whose dependencies — `CairoMakie`,
 `UMAP`, `MultivariateStats`, `KernelDensity`, `ColorSchemes` — are declared as
-weak and are **not** installed with the package. Add them and the extension
-loads itself:
+weak and are **not** installed with the package. Add them to your **default
+environment** and the extension loads itself:
 
 ```julia
-using Pkg; Pkg.add(["CairoMakie","ColorSchemes","KernelDensity",
-                    "MultivariateStats","UMAP"])
+using Pkg
+Pkg.activate()                 # the default (@v1.x) environment, not nabachd's
+Pkg.add(["CairoMakie","ColorSchemes","KernelDensity",
+         "MultivariateStats","UMAP"])
+```
+
+```julia
 using NABACHD, CairoMakie      # the extension loads here
 ```
+
+Packages in the default environment stay loadable whichever project is active,
+so this works for a cloned checkout too.
+
+> **Install the five anywhere but nabachd's own project.** `Pkg.add`ing them
+> with `--project=.` active moves them out of `[weakdeps]` and into `[deps]`,
+> which makes them hard dependencies for everyone who installs the package and
+> stops them working as extension triggers. The reverse is also worth knowing:
+> `Pkg.resolve()` on a clone drops them from the manifest, because resolving
+> installs hard dependencies only. Neither is a bug, and the test suite fails
+> if `[deps]` ever gains one of them.
 
 ## Method
 

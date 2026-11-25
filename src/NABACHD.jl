@@ -193,10 +193,14 @@ for f in (:plot_k_calibration, :plot_k_sd, :plot_mean_peak,
             """ :
             """
             These optional packages are missing: $(join(missing_deps, ", ")).
-            Install them, then load CairoMakie to trigger the extension:
+            Install them into your default environment, not into NABACHD's own
+            project: adding them to the project would move them out of
+            [weakdeps] and into [deps], which disables the extension.
 
-                using Pkg; Pkg.add($(repr(_PLOT_DEPS)))
+                using Pkg; Pkg.activate(); Pkg.add($(repr(_PLOT_DEPS)))
                 using CairoMakie
+
+            They stay loadable from there with any project active.
             """))
     end
 end
