@@ -261,6 +261,7 @@ function part3(; nperm = NPERM_BIG)
                      ceiling=c_m.mean, ceiling_sd=c_m.sd,
                      ceiling_reps=P3_CEIL, ceiling_sem=c_m.sd / sqrt(P3_CEIL),
                      ceil_refweights=c_o.mean,
+                     ceil_own_pr=c_o.pr_mean, ceil_own_pr_sd=c_o.pr_sd,
                      frac_ceiling=a_dw / c_m.mean,
                      frac_ceiling_lo=ci.lo / c_m.mean,
                      frac_ceiling_hi=ci.hi / c_m.mean,
@@ -269,6 +270,7 @@ function part3(; nperm = NPERM_BIG)
         @info "  $tag: UK($nq)->US($nr) over $(size(Mq,1)) variants, $ns shared: " *
               "single=$(round(a_sw,digits=4)) double=$(round(a_dw,digits=4)) " *
               "[$(round(ci.lo,digits=4)), $(round(ci.hi,digits=4))] " *
+              "ceil_own_PR=$(round(c_o.pr_mean,digits=2))±$(round(c_o.pr_sd,digits=2)) " *
               "ceiling=$(round(c_m.mean,digits=4))±$(round(c_m.sd,digits=3)) " *
               "→ $(round(100*a_dw/c_m.mean,digits=1))% of ceiling"
     end
@@ -554,6 +556,12 @@ function _ceiling(Xr::AbstractMatrix, wr, nA::Int, mode; rng, reps::Int)
     centred || @warn "_ceiling: Xr's columns are not centred; using the slow path"
 
     vals = Vector{Float64}(undef, reps)
+    # Participation ratio of the query-sized side on each draw. Under :own this
+    # is the quantity the weight-profile argument rests on — how concentrated a
+    # random subset of the reference panel is — so it is reported rather than
+    # recomputed by hand. Under a transplanted vector it is constant and equals
+    # the query panel's own PR.
+    prA  = Vector{Float64}(undef, reps)
     for i in 1:reps
         perm = randperm(rng, p)
         a, b = perm[1:nA], perm[nA+1:end]
@@ -566,10 +574,12 @@ function _ceiling(Xr::AbstractMatrix, wr, nA::Int, mode; rng, reps::Int)
                                         "$(length(mode)) long, need $nA")
             collect(mode), wr[b]
         end
+        prA[i]  = _pr(ua)
         vals[i] = centred ? _cka_centred_gram(C2, a, b, ua, ub) :
                             cka(Xr[:, a], Xr[:, b]; wq = ua, wr = ub)
     end
-    (mean = mean(vals), sd = std(vals), nA = nA, nB = p - nA)
+    (mean = mean(vals), sd = std(vals), nA = nA, nB = p - nA,
+     pr_mean = mean(prA), pr_sd = reps > 1 ? std(prA) : 0.0)
 end
 
 # CKA between two column subsets of one already-centred matrix, read off
@@ -650,6 +660,7 @@ function part5()
                      ceiling=c_m.mean, ceiling_sd=c_m.sd,
                      ceiling_reps=CEIL_REPS, ceiling_sem=c_m.sd/sqrt(CEIL_REPS),
                      ceil_refweights=c_own.mean,
+                     ceil_own_pr=c_own.pr_mean, ceil_own_pr_sd=c_own.pr_sd,
                      frac_ceiling=a_dw/c_m.mean,
                      frac_ceiling_lo=ci.lo/c_m.mean,
                      frac_ceiling_hi=ci.hi/c_m.mean,
@@ -666,6 +677,7 @@ function part5()
         @info "  $qn($nq)→$rn($nr) over $(size(Mq,1)) variants: " *
               "single=$(round(a_sw,digits=4)) double=$(round(a_dw,digits=4)) " *
               "[$(round(ci.lo,digits=4)), $(round(ci.hi,digits=4))] " *
+              "ceil_own_PR=$(round(c_own.pr_mean,digits=2))±$(round(c_own.pr_sd,digits=2)) " *
               "ceiling=$(round(c_m.mean,digits=4))±$(round(c_m.sd,digits=3)) " *
               "→ $(round(100*a_dw/c_m.mean,digits=1))% of ceiling | vme_r=$(round(vme,digits=3))"
     end
