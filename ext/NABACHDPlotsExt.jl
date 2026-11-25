@@ -1,15 +1,22 @@
-# plots.jl — figure ports for the MHC-I neighbourhood analysis (CairoMakie).
+# NABACHDPlotsExt — figure ports for the MHC-I neighbourhood analysis.
 #
-# A standalone module so the core `MHC1Neighbourhoods` module stays light
-# (CSV / DataFrames / Statistics only). Load it separately when you want
-# figures:
+# A package extension: Julia loads this automatically when CairoMakie,
+# ColorSchemes, KernelDensity, MultivariateStats and UMAP are all present in
+# the session alongside NABACHD. Nothing needs to be included by hand, and the
+# core package installs without any of these.
 #
-#     include("src/plots.jl"); using .NeighbourhoodPlots
+#     using Pkg; Pkg.add(["CairoMakie","ColorSchemes","KernelDensity",
+#                         "MultivariateStats","UMAP"])
+#     using NABACHD, CairoMakie      # the extension loads here
+#     save_all_figures(res, query, reference; outdir="figures")
 #
 # Every function returns a CairoMakie `Figure`; `save_all_figures` writes the
 # full set to a directory. Colours follow the project-wide viridis convention.
 
-module NeighbourhoodPlots
+module NABACHDPlotsExt
+
+using NABACHD
+
 
 using CairoMakie
 using Statistics
@@ -20,10 +27,7 @@ using Random
 using ColorSchemes
 using DataFrames
 
-export plot_k_calibration, plot_k_sd, plot_mean_peak, plot_weighted_unweighted,
-       plot_ranked, plot_profile_densities, umap_embedding,
-       plot_umap_species, plot_umap_scored,
-       plot_panel_alignment, plot_panel_alignments, save_all_figures
+import NABACHD: plot_k_calibration, plot_k_sd, plot_mean_peak, plot_weighted_unweighted, plot_ranked, plot_profile_densities, umap_embedding, plot_umap_species, plot_umap_scored, plot_panel_alignment, plot_panel_alignments, save_all_figures
 
 CairoMakie.activate!(type="png")
 

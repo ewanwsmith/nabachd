@@ -54,7 +54,11 @@ export ProfileSet, nvariants, nalleles,
        column_center, cka, panel_alignment, PanelAlignment,
        informative_variants, alignment_sensitivity, AlignmentSensitivity,
        Neighbourhood, analyse,
-       EscapeConcordance, escape_concordance, sample_local_genotypes
+       EscapeConcordance, escape_concordance, sample_local_genotypes,
+       plot_k_calibration, plot_k_sd, plot_mean_peak,
+       plot_weighted_unweighted, plot_ranked, plot_profile_densities,
+       umap_embedding, plot_umap_species, plot_umap_scored,
+       plot_panel_alignment, plot_panel_alignments, save_all_figures
 
 """
     Neighbourhood
@@ -156,6 +160,45 @@ function analyse(query::ProfileSet, reference::ProfileSet;
 
     Neighbourhood(scores, calibration, k_used, R,
                   copy(query.alleles), copy(reference.alleles), freq, alignment)
+end
+
+
+# ── Figures: provided by a package extension ────────────────────────────────
+# These names are declared here but have no methods until the plotting
+# extension loads. The extension (ext/NABACHDPlotsExt.jl) is triggered
+# automatically once CairoMakie, ColorSchemes, KernelDensity,
+# MultivariateStats and UMAP are all available in the session, so the core
+# package installs without any of them. The fallback below turns a
+# would-be MethodError into an instruction.
+const _PLOT_DEPS = ["CairoMakie", "ColorSchemes", "KernelDensity",
+                    "MultivariateStats", "UMAP"]
+
+for f in (:plot_k_calibration, :plot_k_sd, :plot_mean_peak,
+          :plot_weighted_unweighted, :plot_ranked, :plot_profile_densities,
+          :umap_embedding, :plot_umap_species, :plot_umap_scored,
+          :plot_panel_alignment, :plot_panel_alignments, :save_all_figures)
+    @eval function $f(args...; kwargs...)
+        # If the extension is loaded, the call simply did not match any of its
+        # methods — report that, rather than blaming the extension.
+        Base.get_extension(@__MODULE__, :NABACHDPlotsExt) === nothing ||
+            throw(MethodError($f, args))
+        missing_deps = filter(d -> Base.find_package(d) === nothing, _PLOT_DEPS)
+        error("""
+            $($(QuoteNode(f))) needs the plotting extension, which is not loaded.
+            """ * (isempty(missing_deps) ?
+            """
+            The packages are installed, so load one of them to trigger it:
+
+                using CairoMakie
+            """ :
+            """
+            These optional packages are missing: $(join(missing_deps, ", ")).
+            Install them, then load CairoMakie to trigger the extension:
+
+                using Pkg; Pkg.add($(repr(_PLOT_DEPS)))
+                using CairoMakie
+            """))
+    end
 end
 
 end # module

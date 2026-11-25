@@ -558,6 +558,48 @@ Random.seed!(1234)   # determinism for the randomised fixtures below
     end
 
     # ─────────────────────────────────────────────────────────────────────────
+    @testset "figure extension: stubs and fallback" begin
+        # The twelve figure functions are declared in the core module and given
+        # methods by ext/NABACHDPlotsExt.jl, which Julia loads only when all of
+        # CairoMakie, ColorSchemes, KernelDensity, MultivariateStats and UMAP
+        # are present. The suite runs without them, so what is tested here is
+        # the core side: the names exist, are exported, and fail with an
+        # instruction rather than a bare MethodError.
+        FIGFNS = (:plot_k_calibration, :plot_k_sd, :plot_mean_peak,
+                  :plot_weighted_unweighted, :plot_ranked, :plot_profile_densities,
+                  :umap_embedding, :plot_umap_species, :plot_umap_scored,
+                  :plot_panel_alignment, :plot_panel_alignments, :save_all_figures)
+        for f in FIGFNS
+            @test isdefined(NABACHD, f)
+            @test Base.isexported(NABACHD, f)
+        end
+
+        ext_loaded = Base.get_extension(NABACHD, :NABACHDPlotsExt) !== nothing
+        if ext_loaded
+            # Someone ran the suite with the optional packages available: the
+            # extension must have added methods on top of the fallback.
+            @test length(methods(NABACHD.save_all_figures)) > 1
+            @test length(methods(NABACHD.plot_k_calibration)) > 1
+        else
+            # Without the extension every name has exactly the fallback, and it
+            # must name the missing packages and how to install them.
+            @test length(methods(NABACHD.save_all_figures)) == 1
+            err = try
+                NABACHD.save_all_figures(nothing, nothing, nothing; outdir="x"); nothing
+            catch e; sprint(showerror, e) end
+            @test err !== nothing
+            @test occursin("plotting extension", err)
+            @test occursin("Pkg.add", err)
+            @test occursin("CairoMakie", err)
+        end
+
+        # The extension is declared in Project.toml and its file exists; a
+        # rename on one side only would silently disable every figure.
+        proj = read(joinpath(@__DIR__, "..", "Project.toml"), String)
+        @test occursin("NABACHDPlotsExt", proj)
+        @test isfile(joinpath(@__DIR__, "..", "ext", "NABACHDPlotsExt.jl"))
+    end
+
     @testset "escape_concordance: per-allele null" begin
         rng = MersenneTwister(4242)
         m   = 250

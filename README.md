@@ -10,16 +10,16 @@ quantifying the *meaningfulness* of MHC-I binding escape from one allele panel
 relative to another, from
 [CD8scape](https://doi.org/10.64898/2026.04.20.719634) output.
 
-The method works at two levels. **Per allele:** for each allele in a **query**
+The package implements two methods. **Per allele:** for each allele in a **query**
 panel (e.g. cattle BoLA), its per-variant escape profile is correlated against
 every allele in a larger, optionally frequency-weighted **reference** panel
 (e.g. the human HLA repertoire); a neighbourhood size *k* is chosen
 automatically, and the **frequency-weighted top-*k* neighbourhood r** summarises
 how closely that query allele's escape landscape is mirrored by the reference.
 **Per panel:** a single **neighbourhood alignment** — the frequency-weighted
-centred kernel alignment (CKA) between the two panels, with a permutation null —
-scores whether the two panels organise the *variant* escape landscape the same
-way. Unlike the per-allele metric, the alignment is **symmetric**:
+centred kernel alignment (CKA) between the two panels, double-centred and
+reported against an attainable **ceiling** — scores whether the two panels
+organise the *variant* escape landscape the same way. Unlike the per-allele metric, the alignment is **symmetric**:
 `alignment(A, B) = alignment(B, A)`, so the **query** / **reference** labels
 (which do matter for the per-allele step) are irrelevant to it — neither panel
 is privileged. It is bounded in [0, 1] and comparable across panel pairs of
@@ -38,15 +38,31 @@ internally — no pre-processing.
 Requires Julia ≥ 1.10 ([juliaup](https://github.com/JuliaLang/juliaup)
 recommended).
 
+```julia
+using Pkg
+Pkg.add(url = "https://github.com/ewanwsmith/nabachd")
+```
+
+or, to work on it:
+
 ```bash
 git clone https://github.com/ewanwsmith/nabachd.git
 cd nabachd
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 ```
 
-The core module (`CSV`, `DataFrames`, `Statistics` only) loads quickly; the
-plotting module additionally pulls in `CairoMakie` and `UMAP` and is loaded only
-when figures are requested.
+The core module depends only on `CSV`, `DataFrames`, `LinearAlgebra`, `Random`
+and `Statistics`, so a normal install is light. Figures live in a **package
+extension** (`ext/NABACHDPlotsExt.jl`) whose dependencies — `CairoMakie`,
+`UMAP`, `MultivariateStats`, `KernelDensity`, `ColorSchemes` — are declared as
+weak and are **not** installed with the package. Add them and the extension
+loads itself:
+
+```julia
+using Pkg; Pkg.add(["CairoMakie","ColorSchemes","KernelDensity",
+                    "MultivariateStats","UMAP"])
+using NABACHD, CairoMakie      # the extension loads here
+```
 
 ## Method
 
@@ -95,11 +111,24 @@ set of variants:
    needs no allele correspondence between panels (invariant to rotation /
    relabelling of the allele basis) and is defined for panels of different sizes
    — so alignments for different panel pairs (BoLA↔HLA, BoLA↔SLA, HLA-pop↔HLA-pop)
-   are directly comparable. A permutation null (shuffling one panel's variant
-   rows relative to the other) gives an empirical *p* and a standardised effect
-   *z*, which de-baseline the shared zero-inflation of escape profiles and make
-   the score comparable across pairs. Skip it with `--no-panel`; set the
-   permutation count with `--nperm`.
+   are directly comparable.
+
+   Two further steps make the number interpretable. Each panel is **centred
+   twice** — once per allele across variants, once per variant across the
+   panel's own weighted alleles — because two panels scoring the same peptides
+   agree closely on which variants are disruptive at all, and that agreement
+   reflects the peptides rather than the alleles. What remains is the
+   allele-by-variant interaction. The result is then scaled by a **ceiling**:
+   the alignment reached when both sides describe the same repertoire, obtained
+   by splitting the reference panel into a query-sized part and a remainder,
+   matched on weight profile as well as on allele count. The ceiling is a scale
+   rather than a bound, so a pairing can exceed 100%. Uncertainty is a
+   percentile bootstrap over variants.
+
+   A permutation null is **not** used: permuting one panel's variant rows
+   destroys all variant-level correspondence, so with tens of thousands of
+   variants every pairing exceeds every permutation and the test returns its
+   floor. Skip the panel step with `--no-panel`.
 
    *Zero-inflation sensitivity* (`--sensitivity`): escape profiles fill
    non-binding / structurally-absent cells with 0, and a block of all-zero
@@ -182,7 +211,7 @@ via `--query-format wide --reference-format wide --sim combined_simulation.csv
 ## Usage (Julia API)
 
 ```julia
-include("src/NABACHD.jl"); using .NABACHD
+using NABACHD              # or: include("src/NABACHD.jl"); using .NABACHD
 
 # combine a list of raw per_allele_best_ranks.csv files into one panel
 segs = ["HA","MP","NA","NP","NS","PA","PB1","PB2"]
@@ -197,12 +226,14 @@ res.k               # selected neighbourhood size (27 for this panel)
 res.scores          # ranked per-allele DataFrame (weighted_nbhd_r, …)
 res.calibration     # k-sweep table
 res.alignment       # panel-level neighbourhood alignment (frequency-weighted
-                    # CKA + permutation null); `nothing` if analysed with panel=false
-res.alignment.alignment   # the CKA in [0, 1]
-res.alignment.z, res.alignment.p   # standardised effect and empirical p vs the null
+                    # CKA); `nothing` if analysed with panel=false
+res.alignment.alignment            # the CKA in [0, 1]
+res.alignment.n_query_effective    # alleles actually carrying weight — quote these,
+res.alignment.pr_query             # and the participation ratio, not catalogue size
+res.alignment.z, res.alignment.p   # permutation null — see the warning below
 
-include("src/plots.jl")     # loads CairoMakie + UMAP
-NeighbourhoodPlots.save_all_figures(res, query, reference; outdir="figures")
+using CairoMakie            # triggers the figure extension
+save_all_figures(res, query, reference; outdir="figures")
 ```
 
 `load_cd8scape` defaults to CD8scape's columns (`Frame,Locus,Mutation` / `MHC` /
@@ -248,6 +279,19 @@ Also `neighbourhood_calibration[_suffix].csv` (the k-sweep) and, in
 
 ## Notes
 
+- **Do not quote `alignment.z` or `alignment.p`.** The permutation null shuffles
+  one panel's variant rows against the other, which destroys all variant-level
+  correspondence. With tens of thousands of variants every pairing exceeds every
+  permutation, so *p* returns its floor of 1/(nperm+1) and cannot separate
+  pairings, and *z* tracks the variant count rather than the alignment (in our
+  data, corr(z, n_variants) = 0.95 against corr(z, alignment) = −0.17). They are
+  retained in the struct for backwards compatibility. Use a bootstrap interval
+  and the ceiling instead.
+- **`n_query` / `n_reference` are catalogue sizes**, which is what the shared
+  fractions are taken against. A zero-weight allele contributes to no inner
+  product, so the sizes the statistic actually saw are `n_query_effective` and
+  `n_reference_effective`, with `pr_query` / `pr_reference` giving the effective
+  number of alleles once weight concentration is accounted for.
 - **UMAP** (`umap_species`, `umap_scored`) is a stochastic 2-D visualisation
   only; layouts differ between implementations (this uses `UMAP.jl`, not R's
   uwot) and none of the neighbourhood statistics depend on it. Its random seed
@@ -256,6 +300,12 @@ Also `neighbourhood_calibration[_suffix].csv` (the k-sweep) and, in
   are not tracked.
 
 ## Tests
+
+```julia
+using Pkg; Pkg.test("NABACHD")
+```
+
+or, from a clone:
 
 ```bash
 julia --project=. test/runtests.jl

@@ -28,8 +28,22 @@ Pkg.activate(@__DIR__)
 using CSV
 using DataFrames
 
-include(joinpath(@__DIR__, "src", "NABACHD.jl"))
-using .NABACHD
+# Load NABACHD as a *package*, not via include(). Julia only triggers package
+# extensions for packages loaded through the package manager; an include()d
+# module becomes a plain Main.NABACHD for which ext/NABACHDPlotsExt.jl would
+# never load, and the figure functions would stay unimplemented. Pkg.activate
+# above makes this repo's own project the active one, so this resolves locally.
+try
+    @eval using NABACHD
+catch
+    println("""
+      Could not load NABACHD from $(@__DIR__).
+      Install this project's dependencies first:
+
+          julia --project=$(@__DIR__) -e 'using Pkg; Pkg.instantiate()'
+      """)
+    rethrow()
+end
 
 # ── argument helpers (manual parsing, CD8scape style) ───────────────────────
 function getflag(argv, name; default=nothing)
@@ -272,11 +286,33 @@ if sens !== nothing
     println("  wrote ", sens_path)
 end
 
+# Figures live in a package extension (ext/NABACHDPlotsExt.jl), which Julia
+# loads automatically once all five plotting packages are present. They are
+# [weakdeps], so the core install carries none of them. Check first, so a
+# missing package gives an instruction rather than a stacktrace.
+const PLOT_DEPS = ["CairoMakie", "ColorSchemes", "KernelDensity",
+                   "MultivariateStats", "UMAP"]
+
 if !hasflag(argv, "--no-figures")
+    missing_deps = filter(d -> Base.find_package(d) === nothing, PLOT_DEPS)
+    if !isempty(missing_deps)
+        println("""
+          Skipping figures: $(join(missing_deps, ", ")) not installed.
+          Figures are optional and not installed with NABACHD. To enable them:
+
+            julia> using Pkg; Pkg.add($(repr(PLOT_DEPS)))
+
+          Everything else has been written. Pass --no-figures to silence this.""")
+        println("Done.")
+        exit(0)
+    end
     println("Rendering figures ...")
-    include(joinpath(@__DIR__, "src", "plots.jl"))
+    # Loading these triggers the extension; save_all_figures then has methods.
+    for d in PLOT_DEPS
+        @eval using $(Symbol(d))
+    end
     figdir = joinpath(outdir, "neighbourhood_figures$sfx")
-    paths = NeighbourhoodPlots.save_all_figures(res, query, reference;
+    paths = save_all_figures(res, query, reference;
                 outdir=figdir,
                 query_label=getflag(argv, "--query-label"; default="query"),
                 reference_label=getflag(argv, "--reference-label"; default="reference"),
