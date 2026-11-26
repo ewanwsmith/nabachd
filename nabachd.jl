@@ -1,7 +1,7 @@
 #!/usr/bin/env julia
 
 ###############################################################################
-# nabachd.jl — NABACHD: Neighbourhood Analysis of Binding-escape Against Class-I HLA Data
+# nabachd.jl — nabachd: Neighbourhood Analysis of Binding-escape Against Class-I HLA Data
 #
 # Command-line interface, in the style of CD8scape: call a command and point it
 # at your CD8scape output. Consumes raw `per_allele_best_ranks.csv` files
@@ -28,16 +28,16 @@ Pkg.activate(@__DIR__)
 using CSV
 using DataFrames
 
-# Load NABACHD as a *package*, not via include(). Julia only triggers package
+# Load nabachd as a *package*, not via include(). Julia only triggers package
 # extensions for packages loaded through the package manager; an include()d
-# module becomes a plain Main.NABACHD for which ext/NABACHDPlotsExt.jl would
+# module becomes a plain Main.nabachd for which ext/nabachdPlotsExt.jl would
 # never load, and the figure functions would stay unimplemented. Pkg.activate
 # above makes this repo's own project the active one, so this resolves locally.
 try
-    @eval using NABACHD
+    @eval using nabachd
 catch
     println("""
-      Could not load NABACHD from $(@__DIR__).
+      Could not load nabachd from $(@__DIR__).
       Install this project's dependencies first:
 
           julia --project=$(@__DIR__) -e 'using Pkg; Pkg.instantiate()'
@@ -57,7 +57,7 @@ splitlist(s) = String.(strip.(split(s, ",")))
 
 function print_help()
     println("""
-NABACHD — Neighbourhood Analysis of Binding-escape Against Class-I HLA Data
+nabachd — Neighbourhood Analysis of Binding-escape Against Class-I HLA Data
 The meaningfulness of MHC-I binding escape between allele panels, from CD8scape output.
 
 USAGE:
@@ -286,7 +286,7 @@ if sens !== nothing
     println("  wrote ", sens_path)
 end
 
-# Figures live in a package extension (ext/NABACHDPlotsExt.jl), which Julia
+# Figures live in a package extension (ext/nabachdPlotsExt.jl), which Julia
 # loads automatically once all five plotting packages are present. They are
 # [weakdeps], so the core install carries none of them. Check first, so a
 # missing package gives an instruction rather than a stacktrace.
@@ -298,7 +298,7 @@ if !hasflag(argv, "--no-figures")
     if !isempty(missing_deps)
         println("""
           Skipping figures: $(join(missing_deps, ", ")) not installed.
-          Figures are optional and not installed with NABACHD. To enable them:
+          Figures are optional and not installed with nabachd. To enable them:
 
             julia> using Pkg; Pkg.add($(repr(PLOT_DEPS)))
 

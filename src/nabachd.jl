@@ -1,11 +1,11 @@
 """
-    NABACHD — Neighbourhood Analysis of Binding-escape Against Class-I HLA Data
+    nabachd — Neighbourhood Analysis of Binding-escape Against Class-I HLA Data
 
 A framework for quantifying the meaningfulness of MHC-I binding escape from one
 allele panel relative to another, from CD8scape escape-profile output. The query
 and reference panels are both configurable, so the method applies to any pair of
 panels — a non-human panel against the human HLA repertoire, or one human panel
-against another. (NABACHD ≈ Scottish Gaelic *nàbachd*, "neighbourhood".)
+against another. (nabachd ≈ Scottish Gaelic *Nàbachd*, "neighbourhood".)
 
 For each allele in a *query* panel, its per-variant escape profile is correlated
 against every allele in a (larger, optionally frequency-weighted) *reference*
@@ -19,7 +19,7 @@ any pair of panels handled by netMHCpan / CD8scape — not only BoLA vs HLA.
 Typical use (see `bin/run.jl` for a config-driven CLI):
 
 ```julia
-using NABACHD
+using nabachd
 res = analyse(
     load_wide("combined_simulation.csv";
               key_cols=["Gene","Locus","Mutation"],
@@ -34,7 +34,7 @@ res.k           # selected neighbourhood size
 res.calibration # k-sweep table
 ```
 """
-module NABACHD
+module nabachd
 
 using CSV
 using DataFrames
@@ -165,7 +165,7 @@ end
 
 # ── Figures: provided by a package extension ────────────────────────────────
 # These names are declared here but have no methods until the plotting
-# extension loads. The extension (ext/NABACHDPlotsExt.jl) is triggered
+# extension loads. The extension (ext/nabachdPlotsExt.jl) is triggered
 # automatically once CairoMakie, ColorSchemes, KernelDensity,
 # MultivariateStats and UMAP are all available in the session, so the core
 # package installs without any of them. The fallback below turns a
@@ -180,7 +180,7 @@ for f in (:plot_k_calibration, :plot_k_sd, :plot_mean_peak,
     @eval function $f(args...; kwargs...)
         # If the extension is loaded, the call simply did not match any of its
         # methods — report that, rather than blaming the extension.
-        Base.get_extension(@__MODULE__, :NABACHDPlotsExt) === nothing ||
+        Base.get_extension(@__MODULE__, :nabachdPlotsExt) === nothing ||
             throw(MethodError($f, args))
         missing_deps = filter(d -> Base.find_package(d) === nothing, _PLOT_DEPS)
         error("""
@@ -193,7 +193,7 @@ for f in (:plot_k_calibration, :plot_k_sd, :plot_mean_peak,
             """ :
             """
             These optional packages are missing: $(join(missing_deps, ", ")).
-            Install them into your default environment, not into NABACHD's own
+            Install them into your default environment, not into nabachd's own
             project: adding them to the project would move them out of
             [weakdeps] and into [deps], which disables the extension.
 

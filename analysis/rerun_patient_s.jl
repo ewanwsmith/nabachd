@@ -26,8 +26,8 @@
 
 using Random, CSV, DataFrames
 
-include(joinpath(@__DIR__, "..", "src", "NABACHD.jl"))
-using .NABACHD
+include(joinpath(@__DIR__, "..", "src", "nabachd.jl"))
+using .nabachd
 
 const GENO = get(ENV, "NABACHD_GENO",
                  expanduser("~/Documents/PhD/nabachd_genotype_representativeness"))

@@ -41,8 +41,8 @@
 
 using Random, CSV, DataFrames, Statistics
 
-include(joinpath(@__DIR__, "..", "src", "NABACHD.jl"))
-using .NABACHD
+include(joinpath(@__DIR__, "..", "src", "nabachd.jl"))
+using .nabachd
 
 const GENO = get(ENV, "NABACHD_GENO",
                  expanduser("~/Documents/PhD/nabachd_genotype_representativeness"))
@@ -74,8 +74,8 @@ function main()
     # ── the cross-run self-correlations, which are what the gap is about ─────
     Mq, Mr = align_profiles(patient, reference)
     R = correlation_matrix(Mq, Mr)
-    qn = NABACHD.normalise_allele.(patient.alleles)
-    rn = NABACHD.normalise_allele.(reference.alleles)
+    qn = nabachd.normalise_allele.(patient.alleles)
+    rn = nabachd.normalise_allele.(reference.alleles)
     println("\nCross-run self-correlation of each shared allele")
     println("(the patient's column vs the reference's column for the SAME allele):")
     for (i, a) in enumerate(qn)

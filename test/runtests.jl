@@ -5,12 +5,15 @@ using LinearAlgebra
 using CSV
 using Random
 
-include(joinpath(@__DIR__, "..", "src", "NABACHD.jl"))
-using .NABACHD
+# Load as a package, not with include(): package extensions only trigger for
+# packages loaded through the package manager, so an include()d module leaves
+# ext/nabachdPlotsExt.jl permanently unloaded and the extension-loaded branch
+# of "figure extension: stubs and fallback" unreachable.
+using nabachd
 
 Random.seed!(1234)   # determinism for the randomised fixtures below
 
-@testset "NABACHD" begin
+@testset "nabachd" begin
 
     # ─────────────────────────────────────────────────────────────────────────
     @testset "arcsin transform" begin
@@ -560,7 +563,7 @@ Random.seed!(1234)   # determinism for the randomised fixtures below
     # ─────────────────────────────────────────────────────────────────────────
     @testset "figure extension: stubs and fallback" begin
         # The twelve figure functions are declared in the core module and given
-        # methods by ext/NABACHDPlotsExt.jl, which Julia loads only when all of
+        # methods by ext/nabachdPlotsExt.jl, which Julia loads only when all of
         # CairoMakie, ColorSchemes, KernelDensity, MultivariateStats and UMAP
         # are present. The suite runs without them, so what is tested here is
         # the core side: the names exist, are exported, and fail with an
@@ -570,22 +573,22 @@ Random.seed!(1234)   # determinism for the randomised fixtures below
                   :umap_embedding, :plot_umap_species, :plot_umap_scored,
                   :plot_panel_alignment, :plot_panel_alignments, :save_all_figures)
         for f in FIGFNS
-            @test isdefined(NABACHD, f)
-            @test Base.isexported(NABACHD, f)
+            @test isdefined(nabachd, f)
+            @test Base.isexported(nabachd, f)
         end
 
-        ext_loaded = Base.get_extension(NABACHD, :NABACHDPlotsExt) !== nothing
+        ext_loaded = Base.get_extension(nabachd, :nabachdPlotsExt) !== nothing
         if ext_loaded
             # Someone ran the suite with the optional packages available: the
             # extension must have added methods on top of the fallback.
-            @test length(methods(NABACHD.save_all_figures)) > 1
-            @test length(methods(NABACHD.plot_k_calibration)) > 1
+            @test length(methods(nabachd.save_all_figures)) > 1
+            @test length(methods(nabachd.plot_k_calibration)) > 1
         else
             # Without the extension every name has exactly the fallback, and it
             # must name the missing packages and how to install them.
-            @test length(methods(NABACHD.save_all_figures)) == 1
+            @test length(methods(nabachd.save_all_figures)) == 1
             err = try
-                NABACHD.save_all_figures(nothing, nothing, nothing; outdir="x"); nothing
+                nabachd.save_all_figures(nothing, nothing, nothing; outdir="x"); nothing
             catch e; sprint(showerror, e) end
             @test err !== nothing
             @test occursin("plotting extension", err)
@@ -596,12 +599,12 @@ Random.seed!(1234)   # determinism for the randomised fixtures below
         # The extension is declared in Project.toml and its file exists; a
         # rename on one side only would silently disable every figure.
         proj = read(joinpath(@__DIR__, "..", "Project.toml"), String)
-        @test occursin("NABACHDPlotsExt", proj)
-        @test isfile(joinpath(@__DIR__, "..", "ext", "NABACHDPlotsExt.jl"))
+        @test occursin("nabachdPlotsExt", proj)
+        @test isfile(joinpath(@__DIR__, "..", "ext", "nabachdPlotsExt.jl"))
 
         # The five triggers must stay weak. `Pkg.add`ing them while this
         # project is active moves them into [deps], which makes them hard
-        # dependencies of everyone who installs NABACHD and stops them
+        # dependencies of everyone who installs nabachd and stops them
         # functioning as extension triggers. Install them into the default
         # environment instead; they remain loadable with any project active.
         function _toml_table(src, name)
@@ -641,7 +644,7 @@ Random.seed!(1234)   # determinism for the randomised fixtures below
         keys_df = DataFrame(V = string.(1:m))
         reference = ProfileSet(keys_df, ref_names, Mr)
         query     = ProfileSet(keys_df, q_names,   Mq)
-        freqs     = Dict(NABACHD.normalise_allele(a) => 0.1 for a in ref_names)
+        freqs     = Dict(nabachd.normalise_allele(a) => 0.1 for a in ref_names)
 
         ec = escape_concordance(query, reference; frequencies=freqs, k=3,
                                 nperm=100, rng=MersenneTwister(9))
@@ -654,8 +657,8 @@ Random.seed!(1234)   # determinism for the randomised fixtures below
         end
         # ── each query allele is calibrated against its OWN locus ────────────
         for row in eachrow(pa)
-            @test row.null_locus == NABACHD._allele_locus(
-                      NABACHD.normalise_allele(row.allele))
+            @test row.null_locus == nabachd._allele_locus(
+                      nabachd.normalise_allele(row.allele))
             @test row.n_null_allele > 0
             @test 0.0 <= row.percentile_allele <= 1.0
             @test 0.0 <= row.p_allele <= 1.0
@@ -690,10 +693,10 @@ Random.seed!(1234)   # determinism for the randomised fixtures below
         @test ec_g.E ≈ ec.E atol = 1e-12
 
         # ── locus parser is shared with the null sampler ─────────────────────
-        @test NABACHD._allele_locus("HLA-A01:01") == "A"
-        @test NABACHD._allele_locus("BoLA-N:03401") == "N"
-        @test NABACHD._allele_locus("SLA-1:0101") == "1"
-        @test NABACHD._allele_locus("nonsense") === nothing
+        @test nabachd._allele_locus("HLA-A01:01") == "A"
+        @test nabachd._allele_locus("BoLA-N:03401") == "N"
+        @test nabachd._allele_locus("SLA-1:0101") == "1"
+        @test nabachd._allele_locus("nonsense") === nothing
     end
 
     @testset "panel_alignment: effective panel sizes" begin

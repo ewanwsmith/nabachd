@@ -28,8 +28,8 @@
 #
 # Results are written to RESULTS below, one CSV per part.
 
-include(joinpath(@__DIR__, "..", "src", "NABACHD.jl"))
-using .NABACHD
+include(joinpath(@__DIR__, "..", "src", "nabachd.jl"))
+using .nabachd
 using DataFrames, CSV, Random, Statistics
 using LinearAlgebra: BLAS
 
@@ -223,7 +223,7 @@ function part3(; nperm = NPERM_BIG)
     # an allele from its own neighbourhood, which says nothing about whether the
     # panel-level alignment is carried by the shared block.
     Mq, Mr = align_profiles(uk, us)
-    nmz(x) = NABACHD.normalise_allele(x)
+    nmz(x) = nabachd.normalise_allele(x)
     uk_names, us_names = nmz.(uk.alleles), nmz.(us.alleles)
     shared = intersect(Set(uk_names), Set(us_names))
     wq_all, wr_all = frequency_vector(uk, freq_uk), frequency_vector(us, freq_us)

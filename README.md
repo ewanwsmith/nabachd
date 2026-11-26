@@ -1,9 +1,9 @@
-# NABACHD
+# nabachd
 
 **N**eighbourhood **A**nalysis of **B**inding-escape **A**gainst **C**lass-I
 **H**LA **D**ata
 
-*nàbachd* /ˈnaːbəxk/ — neighbourhood in Scottish Gaelic
+*Nàbachd* /ˈnaːbəxk/ — neighbourhood in Scottish Gaelic
 
 A Julia implementation of a metric of **MHC-I neighbourhoods**: a framework for
 quantifying the *meaningfulness* of MHC-I binding escape from one allele panel
@@ -53,7 +53,7 @@ julia --project=. -e 'using Pkg; Pkg.instantiate()'
 
 The core module depends only on `CSV`, `DataFrames`, `LinearAlgebra`, `Random`
 and `Statistics`, so a normal install is light. Figures live in a **package
-extension** (`ext/NABACHDPlotsExt.jl`) whose dependencies — `CairoMakie`,
+extension** (`ext/nabachdPlotsExt.jl`) whose dependencies — `CairoMakie`,
 `UMAP`, `MultivariateStats`, `KernelDensity`, `ColorSchemes` — are declared as
 weak and are **not** installed with the package. Add them to your **default
 environment** and the extension loads itself:
@@ -66,7 +66,7 @@ Pkg.add(["CairoMakie","ColorSchemes","KernelDensity",
 ```
 
 ```julia
-using NABACHD, CairoMakie      # the extension loads here
+using nabachd, CairoMakie      # the extension loads here
 ```
 
 Packages in the default environment stay loadable whichever project is active,
@@ -159,7 +159,7 @@ set of variants:
 
 ## Pipeline
 
-NABACHD is the terminal step of CD8scape's simulation branch. It reads the
+nabachd is the terminal step of CD8scape's simulation branch. It reads the
 per-allele escape scores CD8scape has already written — it does not re-run any
 binding predictions:
 
@@ -172,7 +172,7 @@ nabachd                       neighbourhood scores + figures
 Use `run_supertype` (a whole allele panel weighted by population frequency), not
 `run` (a single individual's genotype): the method needs a panel of alleles on
 each side. CD8scape produces one run per segment, so a whole-genome panel is the
-list of that panel's `per_allele_best_ranks.csv` files, which NABACHD combines
+list of that panel's `per_allele_best_ranks.csv` files, which nabachd combines
 (you pass them, or their folders, to `--query` / `--reference`).
 
 ## Input: raw CD8scape output
@@ -227,7 +227,7 @@ via `--query-format wide --reference-format wide --sim combined_simulation.csv
 ## Usage (Julia API)
 
 ```julia
-using NABACHD              # or: include("src/NABACHD.jl"); using .NABACHD
+using nabachd              # or: include("src/nabachd.jl"); using .nabachd
 
 # combine a list of raw per_allele_best_ranks.csv files into one panel
 segs = ["HA","MP","NA","NP","NS","PA","PB1","PB2"]
@@ -318,7 +318,7 @@ Also `neighbourhood_calibration[_suffix].csv` (the k-sweep) and, in
 ## Tests
 
 ```julia
-using Pkg; Pkg.test("NABACHD")
+using Pkg; Pkg.test("nabachd")
 ```
 
 or, from a clone:

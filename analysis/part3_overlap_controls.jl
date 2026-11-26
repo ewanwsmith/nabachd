@@ -60,7 +60,7 @@ function _load_p3()
     freq_us = load_frequencies(joinpath(HLAN, "US", "supertype_panel_validated.csv");
                                on_duplicate = :error)
     Mq, Mr = align_profiles(uk, us)
-    nmz(x) = NABACHD.normalise_allele(x)
+    nmz(x) = nabachd.normalise_allele(x)
     uk_names, us_names = nmz.(uk.alleles), nmz.(us.alleles)
     shared = intersect(Set(uk_names), Set(us_names))
     @info "  UK $(nalleles(uk)) × US $(nalleles(us)) catalogue alleles, " *
