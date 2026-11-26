@@ -275,11 +275,26 @@ function part3(; nperm = NPERM_BIG)
               "→ $(round(100*a_dw/c_m.mean,digits=1))% of ceiling"
     end
 
+    # Panel composition, in the same shape as part5_panel_composition.csv, so
+    # the supplementary panel figure can draw these two alongside the three
+    # influenza panels. Weights come from each registry's own dictionary, as
+    # above; an allele with zero weight is not in the panel the statistic sees.
+    comp = DataFrame(species = String[], allele = String[],
+                     weight = Float64[], n_catalogue = Int[])
+    for (tag, prof, w) in (("UK registry", uk, wq_all), ("US registry", us, wr_all))
+        for i in eachindex(prof.alleles)
+            w[i] > 0 || continue
+            push!(comp, (tag, prof.alleles[i], w[i], length(prof.alleles)))
+        end
+    end
+
     mkpath(RESULTS)
     f1 = joinpath(RESULTS, "part3_uk_vs_us_per_allele.csv"); CSV.write(f1, scores)
     f2 = joinpath(RESULTS, "part3_uk_vs_us_alignment.csv");  CSV.write(f2, rows)
+    f3 = joinpath(RESULTS, "part3_panel_composition.csv");   CSV.write(f3, comp)
     @info "  → $f1  ($(nrow(scores)) alleles)"
     @info "  → $f2  ($(nrow(rows)) rows)"
+    @info "  → $f3  ($(nrow(comp)) rows)"
     (alignment=rows, scores=scores)
 end
 
